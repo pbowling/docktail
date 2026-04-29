@@ -28,40 +28,17 @@ conda install -c conda-forge xtb   # installs the xtb binary
 pip install -e ".[dev]"            # editable install with test deps
 ```
 
-### pip only
-
-```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -e .
-```
-
 ---
 
 ## Installation
 
-Install the latest release from PyPI:
-
-```bash
-pip install docktail
-```
-
-Or install directly from source:
+Install directly from source:
 
 ```bash
 git clone https://github.com/pbowling/docktail
 cd docktail
 pip install -e .
 ```
-
-### Optional extras
-
-| Extra | Command | Purpose |
-|-------|---------|---------|
-| `dev` | `pip install "docktail[dev]"` | pytest + coverage |
-| `xtb-api` | `pip install "docktail[xtb-api]"` | xtb-python API backend |
-| `xtb-api-opt` | `pip install "docktail[xtb-api-opt]"` | API backend + geometry optimisation (requires ASE) |
-| `docs` | `pip install "docktail[docs]"` | Sphinx documentation build |
 
 ---
 
@@ -134,22 +111,5 @@ configuration file and the
 ## Running the tests
 
 ```bash
-pip install "docktail[dev]"
 pytest
 ```
-
----
-
-## Building the documentation
-
-```bash
-pip install "docktail[docs]"
-sphinx-build -b html docs docs/_build/html
-open docs/_build/html/index.html
-```
-
----
-
-## License
-
-See [LICENSE](LICENSE) for details.
