@@ -14,8 +14,8 @@ sys.path.insert(0, os.path.abspath(".."))
 # ---------------------------------------------------------------------------
 
 project = "docktail"
-copyright = "2024, docktail contributors"
-author = "docktail contributors"
+copyright = "2026, Paige E. Bowling, Furyal Ahmed, Charles L. Brooks III"
+author = "Paige E. Bowling, Furyal Ahmed, Charles L. Brooks III"
 release = "0.1.0"
 
 # ---------------------------------------------------------------------------

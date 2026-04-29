@@ -1,0 +1,27 @@
+# Read the Docs configuration file
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+
+# Required
+version: 2
+
+# Set the OS, Python version, and other tools you might need
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.11"
+  # Note: explicit build commands and 'image' are omitted because
+  # ReadTheDocs manages the build environment. The `python.install`
+  # section below will instruct RTD to install the project and docs
+  # requirements; RTD will build documentation using its configured
+  # Sphinx command and write to the provided $READTHEDOCS_OUTPUT/html.
+
+# Build documentation from docs/conf.py
+sphinx:
+  configuration: docs/conf.py
+
+python:
+  install:
+    - method: pip
+      path: .
+      extra_requirements:
+        - docs
