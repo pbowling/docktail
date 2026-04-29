@@ -11,6 +11,7 @@ import pytest
 
 from docktail.preprocessing import (
     Atom,
+    _EXCLUDED_FROM_SQM,
     _are_bonded,
     _atoms_within_cutoff,
     _build_bond_list,
@@ -292,3 +293,184 @@ class TestTrimByDistance:
         trimmed = trim_by_distance(atoms, "XXX", cutoff=5.0,
                                    cap_bonds=False, trim_level="residue")
         assert len(trimmed) > 0
+
+
+# ---------------------------------------------------------------------------
+# Solvent / ion exclusion
+# ---------------------------------------------------------------------------
+
+class TestSolventExclusion:
+    def _make_complex_with_water(self):
+        """Return a complex with one near water molecule and one far protein residue."""
+        protein = [
+            _make_atom(serial=1, name="CA", resname="ALA", resseq=1,
+                       x=0.5, y=0.0, z=0.0, element="C", chain="A"),
+        ]
+        water = [
+            _make_atom(serial=2, name="O", resname="HOH", resseq=100,
+                       x=1.0, y=0.0, z=0.0, element="O", chain="A",
+                       record_type="HETATM"),
+        ]
+        ligand = [
+            _make_atom(serial=3, name="C1", resname="LIG", resseq=1,
+                       x=0.0, y=0.0, z=0.0, element="C", chain="B",
+                       record_type="HETATM"),
+        ]
+        return protein + water + ligand
+
+    def test_water_excluded_by_default(self):
+        atoms = self._make_complex_with_water()
+        trimmed = trim_by_distance(atoms, "LIG", cutoff=5.0,
+                                   cap_bonds=False, trim_level="residue",
+                                   exclude_solvent=True)
+        resnames = {a.resname for a in trimmed}
+        assert "HOH" not in resnames
+
+    def test_water_included_when_exclude_off(self):
+        atoms = self._make_complex_with_water()
+        trimmed = trim_by_distance(atoms, "LIG", cutoff=5.0,
+                                   cap_bonds=False, trim_level="residue",
+                                   exclude_solvent=False)
+        resnames = {a.resname for a in trimmed}
+        assert "HOH" in resnames
+
+    def test_known_ion_resnames_in_set(self):
+        for rn in ("NA", "CL", "K", "MG"):
+            assert rn in _EXCLUDED_FROM_SQM
+
+    def test_ion_excluded_from_sqm(self):
+        """A sodium ion near the ligand should be excluded when exclude_solvent=True."""
+        na_ion = _make_atom(serial=10, name="NA", resname="NA", resseq=200,
+                            x=1.0, y=0.0, z=0.0, element="NA", chain="A",
+                            record_type="HETATM")
+        lig = _make_atom(serial=11, name="C1", resname="LIG", resseq=1,
+                         x=0.0, y=0.0, z=0.0, element="C", chain="B",
+                         record_type="HETATM")
+        trimmed = trim_by_distance([na_ion, lig], "LIG", cutoff=5.0,
+                                   cap_bonds=False, trim_level="residue",
+                                   exclude_solvent=True)
+        resnames = {a.resname for a in trimmed}
+        assert "NA" not in resnames
+        assert "LIG" in resnames
+
+    def test_ligand_itself_never_excluded(self):
+        """The ligand residue should always be kept regardless of exclude_solvent."""
+        atoms = self._make_complex_with_water()
+        trimmed = trim_by_distance(atoms, "LIG", cutoff=5.0,
+                                   cap_bonds=False, trim_level="residue",
+                                   exclude_solvent=True)
+        assert any(a.resname == "LIG" for a in trimmed)
+
+
+# ---------------------------------------------------------------------------
+# Backbone cuts only
+# ---------------------------------------------------------------------------
+
+class TestBackboneCutsOnly:
+    def _make_backbone_fragment(self):
+        """Build a minimal 2-residue backbone for trimming tests.
+
+        Residue 1: N-CA-C  (positions 0, 1.5, 3.0 along x)
+        Residue 2: N-CA    (positions 4.5, 6.0 along x)
+        Ligand at origin (y=1 offset so residue 1 is within cutoff).
+        """
+        r1_ca = _make_atom(serial=1, name="CA", resname="ALA", resseq=1,
+                           x=1.5, y=0.0, z=0.0, element="C", chain="A")
+        r1_c  = _make_atom(serial=2, name="C",  resname="ALA", resseq=1,
+                           x=3.0, y=0.0, z=0.0, element="C", chain="A")
+        r2_n  = _make_atom(serial=3, name="N",  resname="GLY", resseq=2,
+                           x=4.5, y=0.0, z=0.0, element="N", chain="A")
+        r2_ca = _make_atom(serial=4, name="CA", resname="GLY", resseq=2,
+                           x=6.0, y=0.0, z=0.0, element="C", chain="A")
+        lig   = _make_atom(serial=5, name="C1", resname="LIG", resseq=1,
+                           x=0.0, y=0.0, z=0.0, element="C", chain="B",
+                           record_type="HETATM")
+        return [r1_ca, r1_c, r2_n, r2_ca, lig]
+
+    def test_backbone_cap_placed_at_C_CA_bond(self):
+        """With backbone_cuts_only, a cap H is added at the C–CA bond only."""
+        atoms = self._make_backbone_fragment()
+        # atom-level cutoff keeps r1_ca, r1_c, lig but not r2_n/r2_ca
+        # The C(r1) – N(r2) bond would normally be capped; with backbone_cuts_only
+        # only C–CA bonds are capped.
+        trimmed = trim_by_distance(atoms, "LIG", cutoff=3.5,
+                                   cap_bonds=True, trim_level="atom",
+                                   backbone_cuts_only=True)
+        cap_atoms = [a for a in trimmed if a.element_symbol() == "H"]
+        # The C(r1_c) is bonded to N(r2_n) [NOT a C–CA bond] → no cap.
+        # r1_c (name "C") has no CA neighbour among removed atoms → no cap here.
+        # Therefore no backbone C–CA cap should be present.
+        assert len(cap_atoms) == 0
+
+    def test_backbone_cap_placed_correctly(self):
+        """H cap is added at a genuine C–CA bond when backbone_cuts_only=True."""
+        # Build: CA (kept) bonded to C (removed): a genuine C–CA bond cut
+        ca = _make_atom(serial=1, name="CA", resname="ALA", resseq=1,
+                        x=0.0, y=0.0, z=0.0, element="C", chain="A")
+        c  = _make_atom(serial=2, name="C",  resname="ALA", resseq=1,
+                        x=1.5, y=0.0, z=0.0, element="C", chain="A")
+        lig = _make_atom(serial=3, name="C1", resname="LIG", resseq=1,
+                         x=0.2, y=0.0, z=0.0, element="C", chain="B",
+                         record_type="HETATM")
+        # cutoff=1.0 keeps CA and lig but not C
+        trimmed = trim_by_distance([ca, c, lig], "LIG", cutoff=1.0,
+                                   cap_bonds=True, trim_level="atom",
+                                   backbone_cuts_only=True)
+        cap_atoms = [a for a in trimmed if a.element_symbol() == "H"]
+        assert len(cap_atoms) == 1
+
+    def test_no_cap_for_non_backbone_bond(self):
+        """Non-C–CA bonds are not capped when backbone_cuts_only=True."""
+        # N bonded to C (N–C peptide bond): should NOT produce a cap.
+        n  = _make_atom(serial=1, name="N",  resname="ALA", resseq=1,
+                        x=0.0, y=0.0, z=0.0, element="N", chain="A")
+        c_bonded = _make_atom(serial=2, name="C",  resname="ALA", resseq=0,
+                               x=1.4, y=0.0, z=0.0, element="C", chain="A")
+        lig = _make_atom(serial=3, name="C1", resname="LIG", resseq=1,
+                         x=0.2, y=0.0, z=0.0, element="C", chain="B",
+                         record_type="HETATM")
+        trimmed = trim_by_distance([n, c_bonded, lig], "LIG", cutoff=1.0,
+                                   cap_bonds=True, trim_level="atom",
+                                   backbone_cuts_only=True)
+        cap_atoms = [a for a in trimmed if a.element_symbol() == "H"]
+        assert len(cap_atoms) == 0
+
+
+# ---------------------------------------------------------------------------
+# xtb_runner – solvent flag helpers
+# ---------------------------------------------------------------------------
+
+class TestSolventFlags:
+    def test_gbsa_flag_for_gfn2(self):
+        from docktail.xtb_runner import _solvent_flags
+        flags = _solvent_flags("gfn2", "water", "gbsa")
+        assert flags == ["--gbsa", "water"]
+
+    def test_alpb_flag_for_gfn2(self):
+        from docktail.xtb_runner import _solvent_flags
+        flags = _solvent_flags("gfn2", "water", "alpb")
+        assert flags == ["--alpb", "water"]
+
+    def test_no_solvent_flag_for_gfnff(self):
+        from docktail.xtb_runner import _solvent_flags
+        flags = _solvent_flags("gfnff", "water", "gbsa")
+        assert flags == []
+
+    def test_no_flag_when_solvent_is_none(self):
+        from docktail.xtb_runner import _solvent_flags
+        flags = _solvent_flags("gfn2", None, "gbsa")
+        assert flags == []
+
+    def test_build_cmd_includes_gbsa(self):
+        from docktail.xtb_runner import _build_cmd
+        cmd = _build_cmd("xtb", "/tmp/x.pdb", "gfn2", 0, 0, False,
+                         solvent="water", solvent_model="gbsa")
+        assert "--gbsa" in cmd
+        assert "water" in cmd
+
+    def test_build_cmd_no_gbsa_for_gfnff(self):
+        from docktail.xtb_runner import _build_cmd
+        cmd = _build_cmd("xtb", "/tmp/x.pdb", "gfnff", 0, 0, True,
+                         solvent="water", solvent_model="gbsa")
+        assert "--gbsa" not in cmd
+

@@ -152,6 +152,8 @@ def prepare(cfg: DocktailConfig) -> List[str]:
                 cutoff=cfg.trim_cutoff,
                 cap_bonds=cfg.cap_bonds,
                 trim_level=cfg.trim_level,
+                exclude_solvent=cfg.exclude_solvent,
+                backbone_cuts_only=cfg.backbone_cuts_only,
             )
             write_pdb(trimmed, str(lig_dir / "complex.pdb"))
 
@@ -178,6 +180,8 @@ def prepare(cfg: DocktailConfig) -> List[str]:
                 ligand_resname=ligand_resname,
                 qm_cutoff=cfg.oniom_qm_cutoff,
                 cap_bonds=cfg.cap_bonds,
+                exclude_solvent=cfg.exclude_solvent,
+                backbone_cuts_only=cfg.backbone_cuts_only,
             )
 
     ligand_names = [name for name, _, _ in pairs]
@@ -191,6 +195,8 @@ def _prepare_oniom_subsystem(
     ligand_resname: str,
     qm_cutoff: float,
     cap_bonds: bool,
+    exclude_solvent: bool = True,
+    backbone_cuts_only: bool = False,
 ) -> str:
     """Create a subsystem.pdb for ONIOM QM region in *lig_dir*."""
     atoms = parse_pdb(complex_pdb)
@@ -200,6 +206,8 @@ def _prepare_oniom_subsystem(
         cutoff=qm_cutoff,
         cap_bonds=cap_bonds,
         trim_level="atom",
+        exclude_solvent=exclude_solvent,
+        backbone_cuts_only=backbone_cuts_only,
     )
     sub_pdb = str(Path(lig_dir) / "subsystem.pdb")
     write_pdb(sub_atoms, sub_pdb)
@@ -400,6 +408,9 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
     protein_pdb = str(lig_dir / "protein.pdb")
     ligand_pdb = str(lig_dir / "ligand.pdb")
 
+    # Solvation is applied to scoring (GFN-n) steps but not force-field relaxation
+    score_solvent = cfg.solvent if cfg.use_solvent_model else None
+
     if cfg.relax:
         _, complex_pdb = relax_structure(
             complex_pdb, str(lig_dir / "relax_complex"),
@@ -407,6 +418,7 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
             charge=cfg.complex_charge(),
             uhf=cfg.complex_uhf(),
             xtb_exe=cfg.xtb_exe,
+            xtb_mode=cfg.xtb_mode,
         )
         _, protein_pdb = relax_structure(
             protein_pdb, str(lig_dir / "relax_protein"),
@@ -414,6 +426,7 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
             charge=cfg.protein_charge,
             uhf=cfg.protein_uhf,
             xtb_exe=cfg.xtb_exe,
+            xtb_mode=cfg.xtb_mode,
         )
         _, ligand_pdb = relax_structure(
             ligand_pdb, str(lig_dir / "relax_ligand"),
@@ -421,6 +434,7 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
             charge=cfg.ligand_charge,
             uhf=cfg.ligand_uhf,
             xtb_exe=cfg.xtb_exe,
+            xtb_mode=cfg.xtb_mode,
         )
 
     single_point_energy(
@@ -429,6 +443,9 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
         charge=cfg.complex_charge(),
         uhf=cfg.complex_uhf(),
         xtb_exe=cfg.xtb_exe,
+        xtb_mode=cfg.xtb_mode,
+        solvent=score_solvent,
+        solvent_model=cfg.solvent_model,
     )
     single_point_energy(
         protein_pdb, str(lig_dir / "sp_protein"),
@@ -436,6 +453,9 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
         charge=cfg.protein_charge,
         uhf=cfg.protein_uhf,
         xtb_exe=cfg.xtb_exe,
+        xtb_mode=cfg.xtb_mode,
+        solvent=score_solvent,
+        solvent_model=cfg.solvent_model,
     )
     single_point_energy(
         ligand_pdb, str(lig_dir / "sp_ligand"),
@@ -443,6 +463,9 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
         charge=cfg.ligand_charge,
         uhf=cfg.ligand_uhf,
         xtb_exe=cfg.xtb_exe,
+        xtb_mode=cfg.xtb_mode,
+        solvent=score_solvent,
+        solvent_model=cfg.solvent_model,
     )
 
     if cfg.oniom:
@@ -455,6 +478,9 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
             charge=cfg.ligand_charge,
             uhf=cfg.ligand_uhf,
             xtb_exe=cfg.xtb_exe,
+            xtb_mode=cfg.xtb_mode,
+            solvent=score_solvent,
+            solvent_model=cfg.solvent_model,
         )
         single_point_energy(
             super_pdb, str(lig_dir / "oniom_mm_super"),
@@ -462,6 +488,7 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
             charge=cfg.complex_charge(),
             uhf=cfg.complex_uhf(),
             xtb_exe=cfg.xtb_exe,
+            xtb_mode=cfg.xtb_mode,
         )
         single_point_energy(
             sub_pdb, str(lig_dir / "oniom_mm_sub"),
@@ -469,4 +496,5 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
             charge=cfg.ligand_charge,
             uhf=cfg.ligand_uhf,
             xtb_exe=cfg.xtb_exe,
+            xtb_mode=cfg.xtb_mode,
         )

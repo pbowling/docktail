@@ -23,6 +23,19 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]
+xtb-api = [
+    "xtb>=22.1",
+]
+xtb-api-opt = [
+    "xtb>=22.1",
+    "ase>=3.22",
+]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-rtd-theme>=2.0",
+    "myst-parser>=2.0",
+    "sphinx-autodoc-typehints>=1.23",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
