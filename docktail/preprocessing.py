@@ -6,8 +6,7 @@ Functions
 parse_pdb          – Read ATOM/HETATM lines into a list of Atom objects
 write_pdb          – Write a list of Atom objects to a PDB file
 merge_protein_ligand – Combine separate protein and ligand PDB files
-trim_by_distance   – Keep only atoms within a cutoff of the ligand,
-                     with optional bond capping by hydrogen atoms
+trim_by_distance   – Keep only atoms within a cutoff of the ligand, with optional bond capping by hydrogen atoms
 """
 
 from __future__ import annotations
