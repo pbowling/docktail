@@ -27,7 +27,12 @@ Example
         --input-dir /path/to/cdocker \\
         --output-dir /path/to/results \\
         --method gfn2 \\
-        --trim --trim-cutoff 8.0
+        --trim --trim-cutoff 8.0 \\
+        --solvent water --solvent-model gbsa
+
+# Use the xtb-python API backend instead of the CLI binary::
+
+    docktail run --config docktail.yaml --xtb-mode api
 """
 
 from __future__ import annotations
@@ -92,13 +97,30 @@ def main():
               help="Trimming granularity.")
 @click.option("--cap/--no-cap", default=None,
               help="Cap severed bonds with hydrogen atoms.")
+@click.option("--exclude-solvent/--no-exclude-solvent", default=None,
+              help="Exclude water/ions from trimmed SQM region (default: on).")
+@click.option("--backbone-cuts/--no-backbone-cuts", default=None,
+              help="Restrict bond caps to backbone C–Cα bonds only.")
 @click.option("--oniom/--no-oniom", default=None,
               help="Compute ONIOM composite energy.")
 @click.option("--oniom-qm-cutoff", default=None, type=float,
               help="Distance cutoff for ONIOM QM region (Å).")
+@click.option("--solvent", default=None,
+              help="Implicit solvent name for GFN-n scoring (e.g. 'water').")
+@click.option("--solvent-model", default=None,
+              type=click.Choice(["gbsa", "alpb"]),
+              help="Implicit solvation model (gbsa or alpb).")
+@click.option("--use-solvent-model/--no-solvent-model", default=None,
+              help="Apply implicit solvation to GFN-n scoring steps.")
+@click.option("--xtb-mode", default=None,
+              type=click.Choice(["cli", "api"]),
+              help="xTB backend: 'cli' (binary) or 'api' (xtb-python).")
+@click.option("--xtb-exe", default=None,
+              help="Path to the xtb executable (CLI mode only).")
 def prepare_cmd(config, input_dir, output_dir, protein_pattern, ligand_pattern,
                 rankings, method, relax, trim, trim_cutoff, trim_level, cap,
-                oniom, oniom_qm_cutoff):
+                exclude_solvent, backbone_cuts, oniom, oniom_qm_cutoff,
+                solvent, solvent_model, use_solvent_model, xtb_mode, xtb_exe):
     """Prepare input files and generate SLURM scripts."""
     cfg = load_config(config)
     _apply_overrides(cfg, {
@@ -113,8 +135,15 @@ def prepare_cmd(config, input_dir, output_dir, protein_pattern, ligand_pattern,
         "trim_cutoff": trim_cutoff,
         "trim_level": trim_level,
         "cap_bonds": cap,
+        "exclude_solvent": exclude_solvent,
+        "backbone_cuts_only": backbone_cuts,
         "oniom": oniom,
         "oniom_qm_cutoff": oniom_qm_cutoff,
+        "solvent": solvent,
+        "solvent_model": solvent_model,
+        "use_solvent_model": use_solvent_model,
+        "xtb_mode": xtb_mode,
+        "xtb_exe": xtb_exe,
     })
 
     try:
@@ -219,17 +248,35 @@ def collect_cmd(config, output_dir, rankings, oniom):
               help="Trimming granularity.")
 @click.option("--cap/--no-cap", default=None,
               help="Cap severed bonds with hydrogen atoms.")
+@click.option("--exclude-solvent/--no-exclude-solvent", default=None,
+              help="Exclude water/ions from trimmed SQM region (default: on).")
+@click.option("--backbone-cuts/--no-backbone-cuts", default=None,
+              help="Restrict bond caps to backbone C–Cα bonds only.")
 @click.option("--oniom/--no-oniom", default=None,
               help="Compute ONIOM composite energy.")
 @click.option("--oniom-qm-cutoff", default=None, type=float,
               help="Distance cutoff for ONIOM QM region (Å).")
+@click.option("--solvent", default=None,
+              help="Implicit solvent name for GFN-n scoring (e.g. 'water').")
+@click.option("--solvent-model", default=None,
+              type=click.Choice(["gbsa", "alpb"]),
+              help="Implicit solvation model (gbsa or alpb).")
+@click.option("--use-solvent-model/--no-solvent-model", default=None,
+              help="Apply implicit solvation to GFN-n scoring steps.")
+@click.option("--xtb-mode", default=None,
+              type=click.Choice(["cli", "api"]),
+              help="xTB backend: 'cli' (binary) or 'api' (xtb-python).")
+@click.option("--xtb-exe", default=None,
+              help="Path to the xtb executable (CLI mode only).")
 @click.option("--submit", "submit_jobs", is_flag=True, default=False,
               help="Submit to SLURM instead of running locally.")
 @click.option("--dry-run", is_flag=True, default=False,
               help="With --submit: print sbatch commands without running them.")
 def run_cmd(config, input_dir, output_dir, protein_pattern, ligand_pattern,
             rankings, method, relax, trim, trim_cutoff, trim_level, cap,
-            oniom, oniom_qm_cutoff, submit_jobs, dry_run):
+            exclude_solvent, backbone_cuts, oniom, oniom_qm_cutoff,
+            solvent, solvent_model, use_solvent_model, xtb_mode, xtb_exe,
+            submit_jobs, dry_run):
     """Run the full pipeline (prepare + execute + collect)."""
     cfg = load_config(config)
     _apply_overrides(cfg, {
@@ -244,8 +291,15 @@ def run_cmd(config, input_dir, output_dir, protein_pattern, ligand_pattern,
         "trim_cutoff": trim_cutoff,
         "trim_level": trim_level,
         "cap_bonds": cap,
+        "exclude_solvent": exclude_solvent,
+        "backbone_cuts_only": backbone_cuts,
         "oniom": oniom,
         "oniom_qm_cutoff": oniom_qm_cutoff,
+        "solvent": solvent,
+        "solvent_model": solvent_model,
+        "use_solvent_model": use_solvent_model,
+        "xtb_mode": xtb_mode,
+        "xtb_exe": xtb_exe,
     })
 
     try:

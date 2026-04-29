@@ -47,6 +47,8 @@ class DocktailConfig:
     trim_cutoff: float = 8.0  # Angstroms from any ligand atom
     cap_bonds: bool = True     # cap severed bonds with H atoms
     trim_level: str = "residue"  # "residue" (whole residue) or "atom" (atom-level)
+    exclude_solvent: bool = True   # exclude water/ions from trimmed SQM region
+    backbone_cuts_only: bool = False  # cap only backbone C–Cα bonds
 
     # ONIOM composite energy
     oniom: bool = False
@@ -60,7 +62,13 @@ class DocktailConfig:
     protein_uhf: int = 0
     ligand_uhf: int = 0
 
-    # xTB executable
+    # Implicit solvation for GFN2-xTB calculations
+    solvent: str = "water"        # solvent name passed to --gbsa / --alpb
+    solvent_model: str = "gbsa"   # "gbsa" or "alpb"
+    use_solvent_model: bool = True  # apply implicit solvation to GFN-n calculations
+
+    # xTB backend: "cli" uses an xtb executable; "api" uses the xtb-python package
+    xtb_mode: str = "cli"
     xtb_exe: str = "xtb"
 
     # SLURM

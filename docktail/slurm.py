@@ -150,10 +150,13 @@ def _xtb_command(
     charge: int,
     uhf: int,
     opt: bool = False,
+    solvent: Optional[str] = None,
+    solvent_model: str = "gbsa",
 ) -> str:
     """Build a single xTB shell command string."""
     from .xtb_runner import _xtb_method_flag, _build_cmd
-    cmd = _build_cmd(xtb_exe, pdb_file, method, charge, uhf, opt)
+    cmd = _build_cmd(xtb_exe, pdb_file, method, charge, uhf, opt,
+                     solvent=solvent, solvent_model=solvent_model)
     return " ".join(cmd)
 
 
@@ -194,8 +197,16 @@ def generate_ligand_jobs(
         protein_pdb = str(Path(lig_dir) / "protein.pdb")
         ligand_pdb = str(Path(lig_dir) / "ligand.pdb")
 
+        # Solvation flags for scoring steps (GFN-n) only
+        score_solvent = cfg.solvent if cfg.use_solvent_model else None
+        solvent_flags = (
+            _solvent_flag_str(cfg.method, score_solvent, cfg.solvent_model)
+            if score_solvent else []
+        )
+        solvent_str = (" " + " ".join(solvent_flags)) if solvent_flags else ""
+
         if cfg.relax:
-            # GFN-FF optimisation sub-dirs
+            # GFN-FF optimisation sub-dirs (no solvation for force-field relax)
             relax_pl = str(Path(lig_dir) / "relax_complex")
             relax_p = str(Path(lig_dir) / "relax_protein")
             relax_l = str(Path(lig_dir) / "relax_ligand")
@@ -235,16 +246,19 @@ def generate_ligand_jobs(
             f"cd {sp_pl} && {cfg.xtb_exe} {complex_pdb} "
             + " ".join(_xtb_method_flag_str(cfg.method))
             + f" --chrg {cfg.complex_charge()} --uhf {cfg.complex_uhf()}"
+            + solvent_str
             + f" > xtb.out 2> xtb.err && cd {lig_dir}",
             f"# Single-point protein",
             f"cd {sp_p} && {cfg.xtb_exe} {protein_pdb} "
             + " ".join(_xtb_method_flag_str(cfg.method))
             + f" --chrg {cfg.protein_charge} --uhf {cfg.protein_uhf}"
+            + solvent_str
             + f" > xtb.out 2> xtb.err && cd {lig_dir}",
             f"# Single-point ligand",
             f"cd {sp_l} && {cfg.xtb_exe} {ligand_pdb} "
             + " ".join(_xtb_method_flag_str(cfg.method))
             + f" --chrg {cfg.ligand_charge} --uhf {cfg.ligand_uhf}"
+            + solvent_str
             + f" > xtb.out 2> xtb.err && cd {lig_dir}",
         ]
 
@@ -255,12 +269,21 @@ def generate_ligand_jobs(
             sub_pdb = str(Path(lig_dir) / "subsystem.pdb")
             super_pdb = str(Path(lig_dir) / "complex.pdb")
 
+            oniom_qm_solvent_flags = (
+                _solvent_flag_str(cfg.oniom_qm_method, score_solvent, cfg.solvent_model)
+                if score_solvent else []
+            )
+            oniom_qm_solvent_str = (
+                (" " + " ".join(oniom_qm_solvent_flags)) if oniom_qm_solvent_flags else ""
+            )
+
             commands += [
                 f"mkdir -p {oniom_qm_dir} {oniom_mm_super} {oniom_mm_sub}",
                 f"# ONIOM subsystem QM",
                 f"cd {oniom_qm_dir} && {cfg.xtb_exe} {sub_pdb} "
                 + " ".join(_xtb_method_flag_str(cfg.oniom_qm_method))
                 + f" --chrg {cfg.ligand_charge} --uhf {cfg.ligand_uhf}"
+                + oniom_qm_solvent_str
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
                 f"# ONIOM supersystem MM",
                 f"cd {oniom_mm_super} && {cfg.xtb_exe} {super_pdb} "
@@ -291,3 +314,13 @@ def _xtb_method_flag_str(method: str) -> List[str]:
     """Thin wrapper around xtb_runner._xtb_method_flag for use in this module."""
     from .xtb_runner import _xtb_method_flag
     return _xtb_method_flag(method)
+
+
+def _solvent_flag_str(
+    method: str,
+    solvent: Optional[str],
+    solvent_model: str = "gbsa",
+) -> List[str]:
+    """Thin wrapper around xtb_runner._solvent_flags for use in this module."""
+    from .xtb_runner import _solvent_flags
+    return _solvent_flags(method, solvent, solvent_model)

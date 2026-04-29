@@ -33,6 +33,23 @@ _DEFAULT_RADIUS = 0.77
 _BOND_TOLERANCE = 0.40  # extra Å added to sum of cov radii
 _CH_BOND_LENGTH = 1.09  # Å – used for H cap placement
 
+# Residue names treated as bulk solvent (water models)
+_SOLVENT_RESNAMES: Set[str] = {"HOH", "WAT", "TIP", "TIP3", "TIP4", "SOL", "H2O"}
+
+# Common monatomic ion residue names to exclude from the SQM region
+_ION_RESNAMES: Set[str] = {
+    "NA", "SOD", "CL", "CLA", "K", "POT", "MG", "CAL",
+    "ZN", "FE", "MN", "CU", "NI", "CO", "CD", "HG",
+    "LI", "CS", "RB", "BA", "SR", "BR", "IOD",
+}
+
+# All residue names that should be excluded from the SQM region by default
+_EXCLUDED_FROM_SQM: Set[str] = _SOLVENT_RESNAMES | _ION_RESNAMES
+
+# Backbone atom names used to identify backbone C–Cα bonds
+_BACKBONE_C_NAME = "C"    # carbonyl carbon
+_BACKBONE_CA_NAME = "CA"  # alpha carbon
+
 
 @dataclass
 class Atom:
@@ -245,6 +262,8 @@ def trim_by_distance(
     cutoff: float = 8.0,
     cap_bonds: bool = True,
     trim_level: str = "residue",
+    exclude_solvent: bool = True,
+    backbone_cuts_only: bool = False,
 ) -> List[Atom]:
     """Keep only atoms within *cutoff* Å of the ligand; optionally cap broken bonds.
 
@@ -264,6 +283,16 @@ def trim_by_distance(
         ``"residue"`` – keep entire residues that have ≥ 1 atom within
         cutoff (no intra-residue bond severing).
         ``"atom"`` – strict per-atom cutoff (bonds may be severed).
+    exclude_solvent:
+        If True (default), water molecules and monatomic ions (see
+        :data:`_EXCLUDED_FROM_SQM`) are removed from the trimmed region.
+        This ensures bulk-solvent species do not enter the SQM region.
+    backbone_cuts_only:
+        If True, hydrogen link atoms (caps) are placed **only** at backbone
+        C–Cα bonds (atom names ``"C"`` and ``"CA"``).  Any other bond that
+        would be severed by the trim boundary is left uncapped.  Use this
+        when preparing an SQM/QM region so that the link-atom placement is
+        chemically well-defined.
 
     Returns
     -------
@@ -287,6 +316,14 @@ def trim_by_distance(
     else:
         kept_idx = within_idx
 
+    # ---- 1b. Remove solvent / ions from the kept set ----
+    if exclude_solvent:
+        kept_idx = {
+            i for i in kept_idx
+            if atoms[i].resname.strip().upper() not in _EXCLUDED_FROM_SQM
+            or atoms[i].resname.strip().upper() == ligand_resname.strip().upper()
+        }
+
     removed_idx: Set[int] = set(range(len(atoms))) - kept_idx
 
     kept_atoms: List[Atom] = [atoms[i] for i in sorted(kept_idx)]
@@ -306,6 +343,21 @@ def trim_by_distance(
             if ri not in removed_idx:
                 continue
             removed_atom = atoms[ri]
+
+            # When backbone_cuts_only is requested, only place a cap when the
+            # severed bond is the intra-residue backbone C–Cα bond.  The cap
+            # is placed on the Cα atom (kept) in the direction of the backbone
+            # C (removed), or on the backbone C (kept) toward Cα (removed).
+            if backbone_cuts_only:
+                k_name = kept_atom.name.strip()
+                r_name = removed_atom.name.strip()
+                is_backbone_cca = (
+                    (k_name == _BACKBONE_CA_NAME and r_name == _BACKBONE_C_NAME)
+                    or (k_name == _BACKBONE_C_NAME and r_name == _BACKBONE_CA_NAME)
+                )
+                if not is_backbone_cca:
+                    continue
+
             direction = removed_atom.coords - kept_atom.coords
             norm = float(np.linalg.norm(direction))
             if norm < 1e-6:
