@@ -1,0 +1,181 @@
+# ============================================================
+# docktail – example configuration file
+# ============================================================
+# Copy this file, fill in the paths and charges for your
+# system, then run:
+#
+#   docktail run --config docktail.yaml
+#
+# or for SLURM clusters:
+#
+#   docktail prepare --config docktail.yaml
+#   docktail submit  --output-dir docktail_output
+#   # (wait for SLURM jobs to finish)
+#   docktail collect --config docktail.yaml
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Input / output
+# ------------------------------------------------------------
+
+# Directory containing CDOCKER PDB output.
+# Expected files: protein*.pdb  ligand*.pdb  (see patterns below)
+input_dir: /data/cdocker_output
+
+# Root directory for all docktail output (created if absent)
+output_dir: /data/docktail_results
+
+# Glob patterns used to identify protein and ligand PDB files
+# inside input_dir.  Adjust if your CDOCKER naming differs.
+protein_pattern: "protein*.pdb"
+ligand_pattern: "ligand*.pdb"
+
+# Optional path to the CDOCKER rankings CSV (adds docking scores
+# to the final report).  Leave blank if you don't have one.
+rankings_file: ""
+
+
+# ------------------------------------------------------------
+# Charges and spin state
+# ------------------------------------------------------------
+# Set the formal charge of each fragment.  Incorrect charges
+# produce meaningless xTB energies – double-check these values.
+
+# Formal charge of the protein (usually 0 for a neutral system)
+protein_charge: 0
+
+# Formal charge of the ligand (e.g. -1 for a carboxylate, +1 for
+# a protonated amine, 0 for a neutral molecule)
+ligand_charge: 0
+
+# Number of unpaired electrons (0 = singlet / closed-shell).
+# Only change for open-shell (radical) systems.
+protein_uhf: 0
+ligand_uhf: 0
+
+
+# ------------------------------------------------------------
+# Geometry relaxation
+# ------------------------------------------------------------
+
+# Run GFN-FF geometry optimisation on each pose before scoring.
+# Recommended – improves energy accuracy at low computational cost.
+relax: true
+
+# xTB method used for the relaxation step.
+# gfnff is fast and suitable for large systems.
+relax_method: gfnff
+
+
+# ------------------------------------------------------------
+# Scoring
+# ------------------------------------------------------------
+
+# xTB method used for single-point binding energy calculations.
+# Choices: gfn2 (default), gfn1, gfn0, gfnff
+method: gfn2
+
+
+# ------------------------------------------------------------
+# Protein trimming (SQM region)
+# ------------------------------------------------------------
+# Trimming reduces the protein to atoms near the ligand so that
+# expensive GFN2-xTB calculations stay tractable for large systems.
+
+# Enable trimming (false = use the full protein)
+trim: false
+
+# Keep all protein atoms within this distance (Å) of any ligand atom
+trim_cutoff: 8.0
+
+# Granularity: "residue" (include whole residues) or "atom"
+trim_level: residue
+
+# Add hydrogen link atoms at severed covalent bonds
+cap_bonds: true
+
+# Remove crystallographic waters and ions from the SQM region
+exclude_solvent: true
+
+# Only add H caps at backbone C–Cα bonds (more conservative capping)
+backbone_cuts_only: false
+
+
+# ------------------------------------------------------------
+# ONIOM composite energy (advanced)
+# ------------------------------------------------------------
+# Splits the system into a QM inner region (near the ligand) and
+# an MM outer region, combining them via the ONIOM scheme.
+
+# Enable ONIOM (requires trim: true)
+oniom: false
+
+# Distance cutoff (Å) defining the QM inner region
+oniom_qm_cutoff: 6.0
+
+# Method for the QM region (inner)
+oniom_qm_method: gfn2
+
+# Method for the MM region (outer)
+oniom_mm_method: gfnff
+
+
+# ------------------------------------------------------------
+# Implicit solvation
+# ------------------------------------------------------------
+
+# Apply implicit solvation to GFN-n scoring calculations
+use_solvent_model: true
+
+# Solvent name recognised by xTB (e.g. water, methanol, acetonitrile)
+solvent: water
+
+# Solvation model: "gbsa" (Generalised Born) or "alpb" (Analytical
+# Linearised Poisson–Boltzmann, more accurate)
+solvent_model: gbsa
+
+
+# ------------------------------------------------------------
+# xTB backend
+# ------------------------------------------------------------
+
+# "cli"  – call the xtb binary (default; requires xtb on $PATH)
+# "api"  – use the xtb-python package (install docktail[xtb-api])
+xtb_mode: cli
+
+# Path to the xtb executable (only used when xtb_mode: cli).
+# "xtb" assumes it is on $PATH; provide an absolute path otherwise.
+xtb_exe: xtb
+
+
+# ------------------------------------------------------------
+# SLURM settings (only used by `docktail prepare` / `submit`)
+# ------------------------------------------------------------
+slurm:
+  # SLURM partition to submit jobs to
+  partition: normal
+
+  # Number of compute nodes per job
+  nodes: 1
+
+  # CPU tasks (threads) per node
+  ntasks: 4
+
+  # Memory per job
+  memory: 8G
+
+  # Wall-clock time limit (HH:MM:SS)
+  time: 24:00:00
+
+  # SLURM account / project (leave blank if not required)
+  account: ""
+
+  # Environment modules to load inside the job script
+  # (add xtb and any other required modules here)
+  modules:
+    - xtb/6.6.1
+
+  # Any extra #SBATCH directives, one per list entry
+  # e.g. "--mail-type=END" or "--constraint=gpu"
+  extra_directives: []
