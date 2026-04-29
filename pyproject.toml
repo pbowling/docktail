@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docktail"
+version = "0.1.0"
+description = "A docking refinement pipeline: GFN-FF relaxation + GFN2-xTB rescoring of CDOCKER output"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.21",
+    "pandas>=1.3",
+    "pyyaml>=5.4",
+    "click>=8.0",
+]
+
+[project.scripts]
+docktail = "docktail.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
