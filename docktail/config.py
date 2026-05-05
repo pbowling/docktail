@@ -62,6 +62,12 @@ class DocktailConfig:
     protein_uhf: int = 0
     ligand_uhf: int = 0
 
+    # Automatic charge inference
+    # When True, docktail will attempt to estimate each ligand's formal charge
+    # from its PDB file using RDKit before running xTB.  If RDKit is not
+    # installed or inference fails, ligand_charge is used as a fallback.
+    auto_ligand_charge: bool = False
+
     # Implicit solvation for GFN2-xTB calculations
     solvent: str = "water"        # solvent name passed to --gbsa / --alpb
     solvent_model: str = "gbsa"   # "gbsa" or "alpb"

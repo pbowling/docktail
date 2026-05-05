@@ -15,7 +15,7 @@ import os
 import subprocess
 from pathlib import Path
 from string import Template
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .config import DocktailConfig, SlurmConfig
 
@@ -27,9 +27,8 @@ _SLURM_TEMPLATE = """\
 #!/bin/bash
 #SBATCH --job-name=${job_name}
 #SBATCH --partition=${partition}
-#SBATCH --nodes=${nodes}
-#SBATCH --ntasks-per-node=${ntasks}
-#SBATCH --mem=${memory}
+#SBATCH --ntasks=${nodes}
+#SBATCH --cpus-per-task=${tasks}
 #SBATCH --time=${time}
 ${account_line}
 ${extra_directives}
@@ -164,6 +163,7 @@ def generate_ligand_jobs(
     ligand_names: List[str],
     output_dir: str,
     cfg: DocktailConfig,
+    ligand_charges: Optional[Dict[str, int]] = None,
 ) -> List[str]:
     """Generate one SLURM script per ligand and return their paths.
 
@@ -180,6 +180,11 @@ def generate_ligand_jobs(
         Root output directory; per-ligand subdirectories are created under it.
     cfg:
         Pipeline configuration.
+    ligand_charges:
+        Optional mapping of ligand name → formal charge.  When provided,
+        overrides ``cfg.ligand_charge`` on a per-ligand basis.  Use this to
+        pass inferred or explicitly set per-ligand charges from
+        ``pipeline.prepare()``.
 
     Returns
     -------
@@ -189,6 +194,11 @@ def generate_ligand_jobs(
     for name in ligand_names:
         lig_dir = str(Path(output_dir) / name)
         os.makedirs(lig_dir, exist_ok=True)
+
+        # Resolve per-ligand charge, falling back to cfg.ligand_charge
+        lig_charge = (ligand_charges or {}).get(name, cfg.ligand_charge)
+        cplx_charge = cfg.protein_charge + lig_charge
+        cplx_uhf = cfg.protein_uhf + cfg.ligand_uhf
 
         commands: List[str] = ["# --- Ligand: {} ---".format(name)]
 
@@ -216,18 +226,21 @@ def generate_ligand_jobs(
                 f"# Relax complex",
                 f"cd {relax_pl} && {cfg.xtb_exe} {complex_pdb} "
                 + " ".join(_xtb_method_flag_str(cfg.relax_method))
-                + f" --opt --chrg {cfg.complex_charge()} --uhf {cfg.complex_uhf()}"
+                + f" --opt --chrg {cplx_charge} --uhf {cplx_uhf}"
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+                f'if grep -q "ABNORMAL TERMINATION" {relax_pl}/xtb.out; then echo "ERROR: xTB relax (complex) terminated abnormally – skipping scoring" >&2; exit 1; fi',
                 f"# Relax protein",
                 f"cd {relax_p} && {cfg.xtb_exe} {protein_pdb} "
                 + " ".join(_xtb_method_flag_str(cfg.relax_method))
                 + f" --opt --chrg {cfg.protein_charge} --uhf {cfg.protein_uhf}"
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+                f'if grep -q "ABNORMAL TERMINATION" {relax_p}/xtb.out; then echo "ERROR: xTB relax (protein) terminated abnormally – skipping scoring" >&2; exit 1; fi',
                 f"# Relax ligand",
                 f"cd {relax_l} && {cfg.xtb_exe} {ligand_pdb} "
                 + " ".join(_xtb_method_flag_str(cfg.relax_method))
-                + f" --opt --chrg {cfg.ligand_charge} --uhf {cfg.ligand_uhf}"
+                + f" --opt --chrg {lig_charge} --uhf {cfg.ligand_uhf}"
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+                f'if grep -q "ABNORMAL TERMINATION" {relax_l}/xtb.out; then echo "ERROR: xTB relax (ligand) terminated abnormally – skipping scoring" >&2; exit 1; fi',
             ]
 
             # Use relaxed structures for scoring
@@ -245,7 +258,7 @@ def generate_ligand_jobs(
             f"# Single-point complex",
             f"cd {sp_pl} && {cfg.xtb_exe} {complex_pdb} "
             + " ".join(_xtb_method_flag_str(cfg.method))
-            + f" --chrg {cfg.complex_charge()} --uhf {cfg.complex_uhf()}"
+            + f" --chrg {cplx_charge} --uhf {cplx_uhf}"
             + solvent_str
             + f" > xtb.out 2> xtb.err && cd {lig_dir}",
             f"# Single-point protein",
@@ -257,7 +270,7 @@ def generate_ligand_jobs(
             f"# Single-point ligand",
             f"cd {sp_l} && {cfg.xtb_exe} {ligand_pdb} "
             + " ".join(_xtb_method_flag_str(cfg.method))
-            + f" --chrg {cfg.ligand_charge} --uhf {cfg.ligand_uhf}"
+            + f" --chrg {lig_charge} --uhf {cfg.ligand_uhf}"
             + solvent_str
             + f" > xtb.out 2> xtb.err && cd {lig_dir}",
         ]
@@ -282,18 +295,18 @@ def generate_ligand_jobs(
                 f"# ONIOM subsystem QM",
                 f"cd {oniom_qm_dir} && {cfg.xtb_exe} {sub_pdb} "
                 + " ".join(_xtb_method_flag_str(cfg.oniom_qm_method))
-                + f" --chrg {cfg.ligand_charge} --uhf {cfg.ligand_uhf}"
+                + f" --chrg {lig_charge} --uhf {cfg.ligand_uhf}"
                 + oniom_qm_solvent_str
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
                 f"# ONIOM supersystem MM",
                 f"cd {oniom_mm_super} && {cfg.xtb_exe} {super_pdb} "
                 + " ".join(_xtb_method_flag_str(cfg.oniom_mm_method))
-                + f" --chrg {cfg.complex_charge()} --uhf {cfg.complex_uhf()}"
+                + f" --chrg {cplx_charge} --uhf {cplx_uhf}"
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
                 f"# ONIOM subsystem MM",
                 f"cd {oniom_mm_sub} && {cfg.xtb_exe} {sub_pdb} "
                 + " ".join(_xtb_method_flag_str(cfg.oniom_mm_method))
-                + f" --chrg {cfg.ligand_charge} --uhf {cfg.ligand_uhf}"
+                + f" --chrg {lig_charge} --uhf {cfg.ligand_uhf}"
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
             ]
 

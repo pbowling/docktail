@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,6 +41,7 @@ from .analysis import (
 from .config import DocktailConfig
 from .preprocessing import (
     Atom,
+    infer_ligand_charge,
     merge_protein_ligand,
     parse_pdb,
     trim_by_distance,
@@ -47,7 +49,12 @@ from .preprocessing import (
 )
 from .reporting import write_csv, write_report
 from .slurm import generate_ligand_jobs, submit_job
-from .xtb_runner import parse_xtb_energy, relax_structure, single_point_energy
+from .xtb_runner import (
+    check_xtb_termination,
+    parse_xtb_energy,
+    relax_structure,
+    single_point_energy,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +137,34 @@ def prepare(cfg: DocktailConfig) -> List[str]:
 
     pairs = _discover_pairs(cfg.input_dir, cfg.protein_pattern, cfg.ligand_pattern)
 
+    # ------------------------------------------------------------------
+    # Per-ligand charge inference (optional)
+    # ------------------------------------------------------------------
+    ligand_charges: Dict[str, int] = {}
+    if cfg.auto_ligand_charge:
+        for name, _prot, ligand_pdb in pairs:
+            inferred = infer_ligand_charge(ligand_pdb)
+            if inferred is not None:
+                ligand_charges[name] = inferred
+                warnings.warn(
+                    f"Auto-detected ligand charge for '{name}': {inferred:+d}. "
+                    "Review this value before relying on the results.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                ligand_charges[name] = cfg.ligand_charge
+                warnings.warn(
+                    f"Could not infer charge for ligand '{name}' "
+                    "(RDKit may not be installed or the PDB could not be parsed); "
+                    f"falling back to ligand_charge={cfg.ligand_charge}.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+    else:
+        for name, _, _ in pairs:
+            ligand_charges[name] = cfg.ligand_charge
+
     for name, protein_pdb, ligand_pdb in pairs:
         lig_dir = out_dir / name
         lig_dir.mkdir(parents=True, exist_ok=True)
@@ -185,7 +220,8 @@ def prepare(cfg: DocktailConfig) -> List[str]:
             )
 
     ligand_names = [name for name, _, _ in pairs]
-    scripts = generate_ligand_jobs(ligand_names, str(out_dir), cfg)
+    scripts = generate_ligand_jobs(ligand_names, str(out_dir), cfg,
+                                   ligand_charges=ligand_charges)
     return scripts
 
 
@@ -264,6 +300,7 @@ def collect(cfg: DocktailConfig) -> pd.DataFrame:
             row["delta_e_ha"] = delta_ha
             row["delta_e_kcal"] = delta_ha * HA_TO_KCAL
         else:
+            _warn_missing_energies(name, lig_dir, e_pl, e_p, e_l)
             row["delta_e_ha"] = None
             row["delta_e_kcal"] = None
 
@@ -350,6 +387,49 @@ def _read_energy(lig_dir: Path, subdir: str) -> Optional[float]:
     return parse_xtb_energy(out_file)
 
 
+def _warn_missing_energies(
+    name: str,
+    lig_dir: Path,
+    e_pl: Optional[float],
+    e_p: Optional[float],
+    e_l: Optional[float],
+) -> None:
+    """Emit warnings for each single-point calculation that is missing or abnormal."""
+    checks = [
+        (e_pl, "sp_complex", "complex"),
+        (e_p,  "sp_protein", "protein"),
+        (e_l,  "sp_ligand",  "ligand"),
+    ]
+    for energy, subdir, label in checks:
+        if energy is not None:
+            continue
+        out_file = str(lig_dir / subdir / "xtb.out")
+        status = check_xtb_termination(out_file)
+        if status == "abnormal":
+            warnings.warn(
+                f"Ligand '{name}': xTB {label} calculation terminated abnormally "
+                f"({out_file}). Binding energy will be skipped.",
+                RuntimeWarning,
+                stacklevel=4,
+            )
+        elif status == "missing":
+            warnings.warn(
+                f"Ligand '{name}': xTB output not found for {label} "
+                f"({out_file}). The job may not have run or may have crashed "
+                "before producing output.",
+                RuntimeWarning,
+                stacklevel=4,
+            )
+        else:
+            # File exists but energy pattern was not matched
+            warnings.warn(
+                f"Ligand '{name}': could not parse energy from {label} output "
+                f"({out_file}). Check the file for errors.",
+                RuntimeWarning,
+                stacklevel=4,
+            )
+
+
 # ---------------------------------------------------------------------------
 # Combined convenience function
 # ---------------------------------------------------------------------------
@@ -399,11 +479,64 @@ def _run_xtb_calculations_directly(cfg: DocktailConfig) -> None:
     )
 
     for lig_dir in ligand_dirs:
-        _run_xtb_for_ligand(lig_dir, cfg)
+        # Resolve per-ligand charge: use inferred charge if available, else
+        # attempt auto-inference at run time, then fall back to cfg value.
+        ligand_charge = cfg.ligand_charge
+        if cfg.auto_ligand_charge:
+            ligand_pdb = str(lig_dir / "ligand.pdb")
+            if os.path.isfile(ligand_pdb):
+                inferred = infer_ligand_charge(ligand_pdb)
+                if inferred is not None:
+                    ligand_charge = inferred
+                    warnings.warn(
+                        f"Auto-detected ligand charge for '{lig_dir.name}': "
+                        f"{inferred:+d}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                else:
+                    warnings.warn(
+                        f"Could not infer charge for ligand '{lig_dir.name}'; "
+                        f"using ligand_charge={cfg.ligand_charge}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+
+        try:
+            _run_xtb_for_ligand(lig_dir, cfg, ligand_charge=ligand_charge)
+        except RuntimeError as exc:
+            warnings.warn(
+                f"xTB calculation failed for ligand '{lig_dir.name}' and will "
+                f"be skipped: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
 
-def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
-    """Run all required xTB calculations for a single ligand directory."""
+def _run_xtb_for_ligand(
+    lig_dir: Path,
+    cfg: DocktailConfig,
+    ligand_charge: Optional[int] = None,
+) -> None:
+    """Run all required xTB calculations for a single ligand directory.
+
+    Parameters
+    ----------
+    lig_dir:
+        Per-ligand output directory containing ``complex.pdb``, ``protein.pdb``,
+        and ``ligand.pdb``.
+    cfg:
+        Pipeline configuration.
+    ligand_charge:
+        Formal charge for the ligand.  When ``None``, falls back to
+        ``cfg.ligand_charge``.
+    """
+    if ligand_charge is None:
+        ligand_charge = cfg.ligand_charge
+
+    complex_charge = cfg.protein_charge + ligand_charge
+    complex_uhf = cfg.protein_uhf + cfg.ligand_uhf
+
     complex_pdb = str(lig_dir / "complex.pdb")
     protein_pdb = str(lig_dir / "protein.pdb")
     ligand_pdb = str(lig_dir / "ligand.pdb")
@@ -415,8 +548,8 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
         _, complex_pdb = relax_structure(
             complex_pdb, str(lig_dir / "relax_complex"),
             method=cfg.relax_method,
-            charge=cfg.complex_charge(),
-            uhf=cfg.complex_uhf(),
+            charge=complex_charge,
+            uhf=complex_uhf,
             xtb_exe=cfg.xtb_exe,
             xtb_mode=cfg.xtb_mode,
         )
@@ -431,7 +564,7 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
         _, ligand_pdb = relax_structure(
             ligand_pdb, str(lig_dir / "relax_ligand"),
             method=cfg.relax_method,
-            charge=cfg.ligand_charge,
+            charge=ligand_charge,
             uhf=cfg.ligand_uhf,
             xtb_exe=cfg.xtb_exe,
             xtb_mode=cfg.xtb_mode,
@@ -440,8 +573,8 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
     single_point_energy(
         complex_pdb, str(lig_dir / "sp_complex"),
         method=cfg.method,
-        charge=cfg.complex_charge(),
-        uhf=cfg.complex_uhf(),
+        charge=complex_charge,
+        uhf=complex_uhf,
         xtb_exe=cfg.xtb_exe,
         xtb_mode=cfg.xtb_mode,
         solvent=score_solvent,
@@ -460,7 +593,7 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
     single_point_energy(
         ligand_pdb, str(lig_dir / "sp_ligand"),
         method=cfg.method,
-        charge=cfg.ligand_charge,
+        charge=ligand_charge,
         uhf=cfg.ligand_uhf,
         xtb_exe=cfg.xtb_exe,
         xtb_mode=cfg.xtb_mode,
@@ -475,7 +608,7 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
         single_point_energy(
             sub_pdb, str(lig_dir / "oniom_qm_sub"),
             method=cfg.oniom_qm_method,
-            charge=cfg.ligand_charge,
+            charge=ligand_charge,
             uhf=cfg.ligand_uhf,
             xtb_exe=cfg.xtb_exe,
             xtb_mode=cfg.xtb_mode,
@@ -485,16 +618,17 @@ def _run_xtb_for_ligand(lig_dir: Path, cfg: DocktailConfig) -> None:
         single_point_energy(
             super_pdb, str(lig_dir / "oniom_mm_super"),
             method=cfg.oniom_mm_method,
-            charge=cfg.complex_charge(),
-            uhf=cfg.complex_uhf(),
+            charge=complex_charge,
+            uhf=complex_uhf,
             xtb_exe=cfg.xtb_exe,
             xtb_mode=cfg.xtb_mode,
         )
         single_point_energy(
             sub_pdb, str(lig_dir / "oniom_mm_sub"),
             method=cfg.oniom_mm_method,
-            charge=cfg.ligand_charge,
+            charge=ligand_charge,
             uhf=cfg.ligand_uhf,
             xtb_exe=cfg.xtb_exe,
             xtb_mode=cfg.xtb_mode,
         )
+

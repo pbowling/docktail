@@ -15,6 +15,7 @@ from docktail.preprocessing import (
     _are_bonded,
     _atoms_within_cutoff,
     _build_bond_list,
+    infer_ligand_charge,
     merge_protein_ligand,
     parse_pdb,
     trim_by_distance,
@@ -473,4 +474,38 @@ class TestSolventFlags:
         cmd = _build_cmd("xtb", "/tmp/x.pdb", "gfnff", 0, 0, True,
                          solvent="water", solvent_model="gbsa")
         assert "--gbsa" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# infer_ligand_charge
+# ---------------------------------------------------------------------------
+
+class TestInferLigandCharge:
+    def test_returns_none_without_rdkit(self, tmp_path, monkeypatch):
+        """infer_ligand_charge returns None gracefully when RDKit is absent."""
+        import sys
+        import builtins
+
+        real_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "rdkit" or name.startswith("rdkit."):
+                raise ImportError("rdkit not available")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", mock_import)
+
+        # Write a minimal ligand PDB so the path exists
+        pdb = tmp_path / "lig.pdb"
+        atoms = [_make_atom(serial=1, name="C1", resname="LIG",
+                             record_type="HETATM", element="C")]
+        write_pdb(atoms, str(pdb))
+
+        result = infer_ligand_charge(str(pdb))
+        assert result is None
+
+    def test_returns_none_for_missing_file(self):
+        """infer_ligand_charge returns None when the file does not exist."""
+        result = infer_ligand_charge("/nonexistent/path/lig.pdb")
+        assert result is None
 

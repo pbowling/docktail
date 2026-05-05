@@ -3,15 +3,17 @@ PDB preprocessing utilities for docktail.
 
 Functions
 ---------
-parse_pdb          – Read ATOM/HETATM lines into a list of Atom objects
-write_pdb          – Write a list of Atom objects to a PDB file
+parse_pdb            – Read ATOM/HETATM lines into a list of Atom objects
+write_pdb            – Write a list of Atom objects to a PDB file
 merge_protein_ligand – Combine separate protein and ligand PDB files
-trim_by_distance   – Keep only atoms within a cutoff of the ligand, with optional bond capping by hydrogen atoms
+infer_ligand_charge  – Estimate formal charge from a ligand PDB (requires RDKit)
+trim_by_distance     – Keep only atoms within a cutoff of the ligand, with optional bond capping by hydrogen atoms
 """
 
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -191,6 +193,52 @@ def merge_protein_ligand(
     all_atoms = protein_atoms + ligand_atoms
     write_pdb(all_atoms, output_pdb)
     return all_atoms
+
+
+# ---------------------------------------------------------------------------
+# Charge inference
+# ---------------------------------------------------------------------------
+
+def infer_ligand_charge(pdb_file: str) -> Optional[int]:
+    """Attempt to estimate the formal charge of a ligand from its PDB file.
+
+    Uses RDKit to parse the structure and infer connectivity from 3-D
+    coordinates, then returns the sum of formal charges assigned during
+    sanitization.
+
+    .. note::
+        RDKit (``rdkit-core`` or ``rdkit``) must be installed for this
+        function to return a value.  It is an optional dependency; if it is
+        absent the function returns ``None`` and the caller should fall back
+        to a default charge of 0.
+
+    Parameters
+    ----------
+    pdb_file:
+        Path to a ligand-only PDB file.
+
+    Returns
+    -------
+    Estimated formal charge as an integer, or ``None`` if RDKit is not
+    available or if structure parsing fails.
+    """
+    try:
+        from rdkit import Chem  # type: ignore[import]
+    except ImportError:
+        return None
+
+    try:
+        mol = Chem.MolFromPDBFile(pdb_file, removeHs=False, sanitize=True)
+        if mol is None:
+            # Retry without sanitization then sanitize manually so we can
+            # catch partial failures without discarding the whole molecule.
+            mol = Chem.MolFromPDBFile(pdb_file, removeHs=False, sanitize=False)
+            if mol is None:
+                return None
+            Chem.SanitizeMol(mol, catchErrors=True)
+        return Chem.GetFormalCharge(mol)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------------------

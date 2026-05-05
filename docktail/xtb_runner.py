@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +45,7 @@ _ENERGY_RE_ALT = re.compile(
 _GFNFF_ENERGY_RE = re.compile(
     r"TOTAL ENERGY\s+([-\d.]+)\s+Eh"
 )
+_ABNORMAL_RE = re.compile(r"ABNORMAL TERMINATION")
 
 # Bohr ↔ Angstrom conversion
 _BOHR_TO_ANG = 0.529177210903
@@ -61,7 +63,7 @@ _ELEMENT_TO_Z: dict[str, int] = {
 
 # Methods for which solvation is meaningful (not force-field based)
 _SOLVATABLE_METHODS = {"gfn2", "gfn2-xtb", "gfn2xtb", "gfn1", "gfn1-xtb",
-                       "gfn1xtb", "gfn0", "gfn0-xtb", "gfn0xtb"}
+                       "gfn1xtb"}
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +79,6 @@ def _xtb_method_flag(method: str) -> list[str]:
         return ["--gfn", "2"]
     if m in ("gfn1", "gfn1-xtb", "gfn1xtb"):
         return ["--gfn", "1"]
-    if m in ("gfn0", "gfn0-xtb", "gfn0xtb"):
-        return ["--gfn", "0"]
     raise ValueError(f"Unknown xTB method: '{method}'")
 
 
@@ -139,7 +139,11 @@ def _run_xtb(
     stdout_file: str = "xtb.out",
     stderr_file: str = "xtb.err",
 ) -> int:
-    """Execute *cmd* in *work_dir*, capturing stdout/stderr."""
+    """Execute *cmd* in *work_dir*, capturing stdout/stderr.
+
+    Emits a :class:`RuntimeWarning` if ``ABNORMAL TERMINATION`` is detected
+    in the xTB output regardless of the process exit code.
+    """
     os.makedirs(work_dir, exist_ok=True)
     out_path = Path(work_dir) / stdout_file
     err_path = Path(work_dir) / stderr_file
@@ -150,7 +154,38 @@ def _run_xtb(
             stdout=out_fh,
             stderr=err_fh,
         )
+    # Detect abnormal termination even when the exit code is 0
+    if check_xtb_termination(str(out_path)) == "abnormal":
+        warnings.warn(
+            f"xTB reported ABNORMAL TERMINATION in {out_path}. "
+            "Energies from this calculation should not be trusted.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
     return result.returncode
+
+
+def check_xtb_termination(output_file: str) -> str:
+    """Check whether an xTB output file indicates normal or abnormal exit.
+
+    Parameters
+    ----------
+    output_file:
+        Path to an ``xtb.out`` file.
+
+    Returns
+    -------
+    ``"normal"``   – file exists and contains no ``ABNORMAL TERMINATION`` marker.
+    ``"abnormal"`` – file exists and ``ABNORMAL TERMINATION`` was found.
+    ``"missing"``  – file does not exist.
+    """
+    if not os.path.isfile(output_file):
+        return "missing"
+    with open(output_file) as fh:
+        content = fh.read()
+    if _ABNORMAL_RE.search(content):
+        return "abnormal"
+    return "normal"
 
 
 def parse_xtb_energy(output_file: str) -> Optional[float]:
@@ -410,10 +445,20 @@ def relax_structure(
         opt_pdb = opt_xyz
 
     if returncode != 0:
-        raise RuntimeError(
+        msg = (
             f"xTB relaxation failed (exit {returncode}). "
             f"See {work_dir}/xtb.err for details."
         )
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        raise RuntimeError(msg)
+    if check_xtb_termination(out_file) == "abnormal":
+        msg = (
+            f"xTB relaxation reported ABNORMAL TERMINATION (exit 0). "
+            f"Scoring will not proceed for this system. "
+            f"See {work_dir}/xtb.out for details."
+        )
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        raise RuntimeError(msg)
     return energy, opt_pdb
 
 
@@ -469,8 +514,10 @@ def single_point_energy(
     out_file = str(Path(work_dir) / "xtb.out")
     energy = parse_xtb_energy(out_file)
     if returncode != 0:
-        raise RuntimeError(
+        msg = (
             f"xTB single-point failed (exit {returncode}). "
             f"See {work_dir}/xtb.err for details."
         )
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        raise RuntimeError(msg)
     return energy
