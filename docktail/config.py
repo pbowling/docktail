@@ -39,6 +39,8 @@ class DocktailConfig:
     # Relaxation
     relax: bool = True
     relax_method: str = "gfnff"
+    relax_trimmed: bool = False  # relax the trimmed complex (with constraints) instead of the full system
+    relax_trim_cutoff: float = 8.0  # trim cutoff (Å) used when building the relaxation region (relax_trimmed=True)
 
     # Scoring method for binding energy
     method: str = "gfn2"
@@ -59,6 +61,7 @@ class DocktailConfig:
 
     # Charges / multiplicity
     protein_charge: int = 0
+    protein_psf: str = ""  # path to PSF file for protein charge estimation (overrides protein_charge when set)
     ligand_charge: int = 0
     protein_uhf: int = 0
     ligand_uhf: int = 0
@@ -77,6 +80,7 @@ class DocktailConfig:
     # xTB backend: "cli" uses an xtb executable; "api" uses the xtb-python package
     xtb_mode: str = "cli"
     xtb_exe: str = "xtb"
+    xtb_scf_iterations: int = 250  # max SCF cycles for GFN-n SP calculations (xTB default 250; increase for large/charged systems)
 
     # SLURM
     slurm: SlurmConfig = field(default_factory=SlurmConfig)

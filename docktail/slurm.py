@@ -35,6 +35,9 @@ ${account_line}
 ${extra_directives}
 ${module_lines}
 
+export OMP_STACKSIZE=16G
+ulimit -s unlimited
+
 set -euo pipefail
 
 cd "${work_dir}"
@@ -170,6 +173,7 @@ def generate_ligand_jobs(
     """Generate one SLURM script per ligand and return their paths.
 
     The script covers:
+
     1. (Optional) GFN-FF relaxation of the full protein+ligand complex,
        isolated protein, and isolated ligand.
     2. (Optional, when relax=True) Post-relaxation trimming via
@@ -206,8 +210,33 @@ def generate_ligand_jobs(
 
         # Resolve per-ligand charge, falling back to cfg.ligand_charge
         lig_charge = (ligand_charges or {}).get(name, cfg.ligand_charge)
-        cplx_charge = cfg.protein_charge + lig_charge
+
+        # Read trimmed protein charges written by prepare() if available.
+        # These account for the fact that the trimmed region has fewer charged
+        # residues than the full protein.
+        _sp_charge_file = Path(lig_dir) / "sp_protein_charge.txt"
+        sp_prot_charge = (
+            int(_sp_charge_file.read_text().strip())
+            if _sp_charge_file.exists()
+            else cfg.protein_charge
+        )
+        _relax_charge_file = Path(lig_dir) / "relax_protein_charge.txt"
+        relax_prot_charge = (
+            int(_relax_charge_file.read_text().strip())
+            if _relax_charge_file.exists()
+            else cfg.protein_charge
+        )
+
+        cplx_charge      = cfg.protein_charge + lig_charge   # full system (relax when not relax_trimmed)
+        relax_cplx_charge = relax_prot_charge + lig_charge   # trimmed relax region
+        sp_cplx_charge   = sp_prot_charge + lig_charge       # SP region
         cplx_uhf = cfg.protein_uhf + cfg.ligand_uhf
+
+        # --iterations flag for SP steps (only added when non-default)
+        iter_flag = (
+            f" --iterations {cfg.xtb_scf_iterations}"
+            if cfg.xtb_scf_iterations != 250 else ""
+        )
 
         commands: List[str] = ["# --- Ligand: {} ---".format(name)]
 
@@ -227,14 +256,27 @@ def generate_ligand_jobs(
         if cfg.relax:
             relax_pl = str(Path(lig_dir) / "relax_complex")
 
+            if cfg.relax_trimmed:
+                # Relax only the trimmed region; apply harmonic constraints
+                # to boundary C atoms and H caps to prevent unphysical drift.
+                relax_input = str(Path(lig_dir) / "complex.pdb")
+                constraints_file = str(Path(lig_dir) / "relax_constraints.inp")
+                constrain_flag = f" --input {constraints_file}"
+                relax_label = "# Relax trimmed complex (with boundary constraints)"
+            else:
+                relax_input = complex_full_pdb
+                constrain_flag = ""
+                relax_label = "# Relax complex (full, no trim)"
+
             commands += [
                 f"mkdir -p {relax_pl}",
-                f"# Relax complex (full, no trim)",
-                f"cd {relax_pl} && {cfg.xtb_exe} {complex_full_pdb} "
+                relax_label,
+                f"cd {relax_pl} && {cfg.xtb_exe} {relax_input} "
                 + " ".join(_xtb_method_flag_str(cfg.relax_method))
-                + f" --opt --chrg {cplx_charge} --uhf {cplx_uhf}"
+                + f" --opt --chrg {relax_cplx_charge} --uhf {cplx_uhf}"
+                + constrain_flag
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
-                f'if grep -q "ABNORMAL TERMINATION" {relax_pl}/xtb.out; then echo "ERROR: xTB relax (complex) terminated abnormally – skipping scoring" >&2; exit 1; fi',
+                f'if grep -q "ABNORMAL TERMINATION" {relax_pl}/xtb.out; then echo "ERROR: xTB relax (complex) terminated abnormally \u2013 skipping scoring" >&2; exit 1; fi',
             ]
 
             if config_path:
@@ -263,31 +305,41 @@ def generate_ligand_jobs(
             f"# Single-point complex",
             f"cd {sp_pl} && {cfg.xtb_exe} {complex_pdb_sp} "
             + " ".join(_xtb_method_flag_str(cfg.method))
-            + f" --chrg {cplx_charge} --uhf {cplx_uhf}"
-            + solvent_str
+            + f" --chrg {sp_cplx_charge} --uhf {cplx_uhf}"
+            + solvent_str + iter_flag
             + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+            f'if grep -qi "convergence criteria cannot be satisfied\\|SCF not converged\\|did not converge" {sp_pl}/xtb.out; then echo "WARNING: SCF did not converge for sp_complex (charge={sp_cplx_charge}) -- energy unreliable; consider increasing xtb_scf_iterations" >&2; fi',
             f"# Single-point protein",
             f"cd {sp_p} && {cfg.xtb_exe} {protein_pdb_sp} "
             + " ".join(_xtb_method_flag_str(cfg.method))
-            + f" --chrg {cfg.protein_charge} --uhf {cfg.protein_uhf}"
-            + solvent_str
+            + f" --chrg {sp_prot_charge} --uhf {cfg.protein_uhf}"
+            + solvent_str + iter_flag
             + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+            f'if grep -qi "convergence criteria cannot be satisfied\\|SCF not converged\\|did not converge" {sp_p}/xtb.out; then echo "WARNING: SCF did not converge for sp_protein (charge={sp_prot_charge}) -- energy unreliable" >&2; fi',
             f"# Single-point ligand",
             f"cd {sp_l} && {cfg.xtb_exe} {ligand_pdb_sp} "
             + " ".join(_xtb_method_flag_str(cfg.method))
             + f" --chrg {lig_charge} --uhf {cfg.ligand_uhf}"
-            + solvent_str
+            + solvent_str + iter_flag
             + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+            f'if grep -qi "convergence criteria cannot be satisfied\\|SCF not converged\\|did not converge" {sp_l}/xtb.out; then echo "WARNING: SCF did not converge for sp_ligand -- energy unreliable" >&2; fi',
         ]
 
         if cfg.oniom:
-            # Determine ONIOM structure paths based on whether relaxation was done
+            # Determine ONIOM structure paths
+            # full_* = written by trim-relaxed (relaxed full OR unrelaxed full for relax_trimmed)
             if cfg.relax:
                 full_cplx_oniom = str(Path(lig_dir) / "full_complex.pdb")
                 full_prot_oniom = str(Path(lig_dir) / "full_protein.pdb")
-                trim_cplx_oniom = complex_pdb_sp
-                trim_prot_oniom = protein_pdb_sp
-                lig_oniom       = ligand_pdb_sp
+                if cfg.relax_trimmed:
+                    # Pre-relaxation trimmed files as the lower-level reference
+                    trim_cplx_oniom = str(Path(lig_dir) / "complex.pdb")
+                    trim_prot_oniom = str(Path(lig_dir) / "protein.pdb")
+                    lig_oniom       = ligand_pdb
+                else:
+                    trim_cplx_oniom = complex_pdb_sp
+                    trim_prot_oniom = protein_pdb_sp
+                    lig_oniom       = ligand_pdb_sp
             else:
                 full_cplx_oniom = complex_full_pdb
                 full_prot_oniom = protein_full_pdb
@@ -323,12 +375,12 @@ def generate_ligand_jobs(
                 f"# ONIOM GFN-FF SP: trimmed complex",
                 f"cd {ff_trim_cplx_dir} && {cfg.xtb_exe} {trim_cplx_oniom} "
                 + mm_flags
-                + f" --chrg {cplx_charge} --uhf {cplx_uhf}"
+                + f" --chrg {sp_cplx_charge} --uhf {cplx_uhf}"
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
                 f"# ONIOM GFN-FF SP: trimmed protein",
                 f"cd {ff_trim_prot_dir} && {cfg.xtb_exe} {trim_prot_oniom} "
                 + mm_flags
-                + f" --chrg {cfg.protein_charge} --uhf {cfg.protein_uhf}"
+                + f" --chrg {sp_prot_charge} --uhf {cfg.protein_uhf}"
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
             ]
 

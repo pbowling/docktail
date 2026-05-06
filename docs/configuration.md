@@ -18,7 +18,9 @@ or overridden on the command line.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `relax` | bool | `true` | Run geometry optimisation before scoring |
-| `relax_method` | str | `gfnff` | xTB method for relaxation |
+| `relax_method` | str | `gfnff` | xTB method for relaxation (`gfnff`, `gfn2`, `gfn1`) |
+| `relax_trimmed` | bool | `false` | Relax only the trimmed region (with boundary constraints) instead of the full system. Requires `trim: true`. |
+| `relax_trim_cutoff` | float | `8.0` | Distance cutoff (Å) used to build the relaxation region when `relax_trimmed: true`. Should be ≥ `trim_cutoff`. |
 
 ## Scoring
 
@@ -30,12 +32,12 @@ or overridden on the command line.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `trim` | bool | `false` | Trim protein to atoms near the ligand |
-| `trim_cutoff` | float | `8.0` | Distance cutoff in Å |
-| `trim_level` | str | `residue` | `"residue"` or `"atom"` granularity |
-| `cap_bonds` | bool | `true` | Add hydrogen caps at severed bonds |
-| `exclude_solvent` | bool | `true` | Remove water / ions from the SQM region |
-| `backbone_cuts_only` | bool | `false` | Only place H caps at backbone C–Cα bonds |
+| `trim` | bool | `false` | Trim protein to atoms within `trim_cutoff` Å of the ligand |
+| `trim_cutoff` | float | `6.0` | Distance cutoff (Å) for the SP scoring region |
+| `trim_level` | str | `residue` | `"residue"` (keep whole residues) or `"atom"` (atom-level) granularity |
+| `cap_bonds` | bool | `true` | Add hydrogen link atoms at severed bonds |
+| `exclude_solvent` | bool | `true` | Remove water and monatomic ions from the trimmed region |
+| `backbone_cuts_only` | bool | `false` | Only place H caps at backbone C–Cα bonds (avoids spurious caps on side-chain cuts) |
 
 ## Implicit solvation
 
@@ -51,15 +53,18 @@ or overridden on the command line.
 |-----|------|---------|-------------|
 | `xtb_mode` | str | `cli` | `"cli"` (binary) or `"api"` (xtb-python) |
 | `xtb_exe` | str | `xtb` | Path / name of the xtb executable (CLI only) |
+| `xtb_scf_iterations` | int | `250` | Maximum SCF cycles for GFN-*n* single-point calculations. Increase (e.g. `500`) when SCF fails to converge on large or highly charged trimmed systems. |
 
 ## Charges
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `protein_charge` | int | `0` | Formal charge of the protein |
+| `protein_charge` | int | `0` | Formal charge of the protein (full system). Used as fallback when `protein_psf` is not set. |
+| `protein_psf` | str | `""` | Path to a CHARMM/NAMD XPLOR PSF file. When provided, the full-system protein charge is read from the PSF (overriding `protein_charge`), and per-ligand trimmed-region charges are estimated automatically from partial charges of matched atoms. Strongly recommended when `trim: true`. |
 | `ligand_charge` | int | `0` | Formal charge of the ligand |
 | `protein_uhf` | int | `0` | Unpaired electrons in the protein |
 | `ligand_uhf` | int | `0` | Unpaired electrons in the ligand |
+| `auto_ligand_charge` | bool | `false` | Attempt to infer each ligand's formal charge from its PDB file using RDKit. Falls back to `ligand_charge` if RDKit is unavailable or inference fails. |
 
 ## ONIOM
 

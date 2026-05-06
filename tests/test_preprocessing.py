@@ -18,6 +18,7 @@ from docktail.preprocessing import (
     infer_ligand_charge,
     merge_protein_ligand,
     parse_pdb,
+    read_charge_from_psf,
     trim_by_distance,
     write_pdb,
 )
@@ -529,4 +530,83 @@ class TestInferLigandCharge:
         """infer_ligand_charge returns None when the file does not exist."""
         result = infer_ligand_charge("/nonexistent/path/lig.pdb")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# read_charge_from_psf
+# ---------------------------------------------------------------------------
+
+def _write_psf(tmp_path, atom_rows: list[str], title: str = "TEST") -> str:
+    """Write a minimal XPLOR PSF file and return its path."""
+    natoms = len(atom_rows)
+    lines = [
+        "PSF CMAP XPLOR",
+        "",
+        f"       1 !NTITLE",
+        f"* {title}",
+        "",
+        f"{natoms:8d} !NATOM",
+    ] + atom_rows + [""]
+    path = tmp_path / "test.psf"
+    path.write_text("\n".join(lines))
+    return str(path)
+
+
+def _atom_row(serial: int, charge: float) -> str:
+    return (f"{serial:8d} PROA {serial:5d}  ALA  CA   CT1  "
+            f"{charge:12.6f}   12.0110           0")
+
+
+class TestReadChargeFromPsf:
+    def test_integer_charge(self, tmp_path):
+        rows = [_atom_row(i + 1, c) for i, c in enumerate([0.5, -0.5, 1.0, -1.0, 1.0])]
+        assert read_charge_from_psf(_write_psf(tmp_path, rows)) == 1
+
+    def test_charge_zero(self, tmp_path):
+        rows = [_atom_row(i + 1, c) for i, c in enumerate([0.25, -0.25, 0.0])]
+        assert read_charge_from_psf(_write_psf(tmp_path, rows)) == 0
+
+    def test_negative_charge(self, tmp_path):
+        rows = [_atom_row(i + 1, c) for i, c in enumerate([-1.0, 0.0])]
+        assert read_charge_from_psf(_write_psf(tmp_path, rows)) == -1
+
+    def test_rounds_to_nearest_integer(self, tmp_path):
+        # Sum is 13.999 — should round to 14 with no warning
+        charges = [1.0] * 13 + [0.999]
+        rows = [_atom_row(i + 1, c) for i, c in enumerate(charges)]
+        result = read_charge_from_psf(_write_psf(tmp_path, rows))
+        assert result == 14
+
+    def test_warns_when_non_integer(self, tmp_path):
+        # Sum is 0.6 — should warn and return 1 (nearest integer)
+        rows = [_atom_row(1, 0.6)]
+        with pytest.warns(UserWarning, match="deviates from the nearest integer"):
+            result = read_charge_from_psf(_write_psf(tmp_path, rows))
+        assert result == 1
+
+    def test_scientific_notation_charges(self, tmp_path):
+        # PSF files often write charges in exponential notation
+        lines = [
+            "PSF CMAP XPLOR", "",
+            "       1 !NTITLE", "* SCI", "",
+            "       3 !NATOM",
+            "       1 PROA     1  ALA  N    NH1   -0.470000       14.0070           0",
+            "       2 PROA     1  ALA  HN   H      0.900000E-01    1.00800           0",
+            "       3 PROA     1  ALA  CA   CT1    3.810000E-01   12.0110           0",
+            "",
+        ]
+        path = tmp_path / "sci.psf"
+        path.write_text("\n".join(lines))
+        result = read_charge_from_psf(str(path))
+        assert result == 0  # -0.47 + 0.09 + 0.381 = 0.001 → rounds to 0
+
+    def test_missing_file_raises(self):
+        with pytest.raises(FileNotFoundError):
+            read_charge_from_psf("/nonexistent/protein.psf")
+
+    def test_no_natom_section_raises(self, tmp_path):
+        path = tmp_path / "bad.psf"
+        path.write_text("PSF CMAP XPLOR\n\n* no atoms here\n")
+        with pytest.raises(ValueError, match="No !NATOM section"):
+            read_charge_from_psf(str(path))
 

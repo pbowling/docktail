@@ -16,7 +16,7 @@ import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import numpy as np
 
@@ -40,9 +40,14 @@ _CH_BOND_LENGTH = 1.09  # Å – used for H cap placement
 # "CA" is intentionally omitted – in protein PDBs it is always alpha-carbon
 # (element C), never calcium (which appears as a HETATM with resname "CA"
 # and should have an explicit element column).
+# "HG" and "CD" are omitted because in protein/nucleic contexts atom names
+# like HG1/HG2 are hydrogens (hydrogen-gamma) and CD/CD1/CD2 are carbons
+# (carbon-delta).  Actual mercury (Hg) and cadmium (Cd) ions appear as
+# HETATM with an explicit element column so no name-inference fallback is
+# needed for them.
 _TWO_LETTER_ELEMENTS: frozenset[str] = frozenset({
     "CL", "BR", "MG", "ZN", "FE", "CU", "MN", "CO", "NI",
-    "HG", "CD", "SE", "AU", "PT", "LI", "AL", "SI", "AS", "NA",
+    "SE", "AU", "PT", "LI", "AL", "SI", "AS", "NA",
 })
 
 # Residue names treated as bulk solvent (water models)
@@ -99,9 +104,29 @@ class Atom:
         for atoms whose names start with a known two-letter element.  All
         other atoms return only the first letter of their name (e.g. SG → S,
         OG → O, CA → C, HN → H).
+
+        Many structure-preparation programs populate the element column with
+        the first two characters of the atom name rather than the true IUPAC
+        symbol.  This produces e.g. "HG" for HG1/HG2 hydrogens (hydrogen-
+        gamma) and "CD" for CD carbons (carbon-delta), which xTB would
+        misinterpret as mercury and cadmium.  For ATOM records, a stored
+        two-letter element whose first character matches a common single-letter
+        bio element (H, C, N, O, S, P) in the atom name is corrected to that
+        single-letter element, unless it is a genuinely two-letter symbol
+        (CL, CO, CU, CR).
         """
         if self.element:
-            return self.element.strip().upper()
+            sym = self.element.strip().upper()
+            # Sanitise mislabelled element columns for ATOM records.
+            if len(sym) == 2 and self.record_type == "ATOM":
+                name_first = re.sub(r"^\d*", "", self.name.strip()).upper()[:1]
+                if (
+                    name_first in "HCNOSP"
+                    and sym[0] == name_first
+                    and sym not in {"CL", "CO", "CU", "CR"}
+                ):
+                    return name_first
+            return sym
         raw = re.sub(r"^\d*", "", self.name.strip()).upper()
         two = raw[:2]
         if two in _TWO_LETTER_ELEMENTS:
@@ -304,18 +329,26 @@ def _are_bonded(a: Atom, b: Atom) -> bool:
 
 
 def _build_bond_list(atoms: List[Atom]) -> Dict[int, List[int]]:
-    """Return adjacency dict {atom_index: [bonded_atom_indices]}."""
+    """Return adjacency dict {atom_index: [bonded_atom_indices]}.
+
+    Uses a KD-tree with a conservative radius to avoid O(n²) pair evaluation.
+    The maximum possible bond threshold is 2 * max_cov_radius + BOND_TOLERANCE.
+    """
+    from scipy.spatial import cKDTree
+
     bonds: Dict[int, List[int]] = {i: [] for i in range(len(atoms))}
     coords = np.array([a.coords for a in atoms])
-    # Use a simple O(n²) search; acceptable for typical protein sizes after trimming
-    for i, ai in enumerate(atoms):
-        ri = _cov_radius(ai.element_symbol())
-        for j in range(i + 1, len(atoms)):
-            aj = atoms[j]
-            rj = _cov_radius(aj.element_symbol())
-            if float(np.linalg.norm(coords[i] - coords[j])) < ri + rj + _BOND_TOLERANCE:
-                bonds[i].append(j)
-                bonds[j].append(i)
+    max_radius = max(_COV_RADII.values(), default=_DEFAULT_RADIUS)
+    search_r = 2 * max_radius + _BOND_TOLERANCE
+
+    tree = cKDTree(coords)
+    pairs = tree.query_pairs(search_r)
+    for i, j in pairs:
+        ri = _cov_radius(atoms[i].element_symbol())
+        rj = _cov_radius(atoms[j].element_symbol())
+        if float(np.linalg.norm(coords[i] - coords[j])) < ri + rj + _BOND_TOLERANCE:
+            bonds[i].append(j)
+            bonds[j].append(i)
     return bonds
 
 
@@ -358,7 +391,8 @@ def trim_by_distance(
     trim_level: str = "residue",
     exclude_solvent: bool = True,
     backbone_cuts_only: bool = False,
-) -> List[Atom]:
+    return_constrained: bool = False,
+) -> Union[List[Atom], Tuple[List[Atom], List[int]]]:
     """Keep only atoms within *cutoff* Å of the ligand; optionally cap broken bonds.
 
     Parameters
@@ -423,20 +457,32 @@ def trim_by_distance(
     kept_atoms: List[Atom] = [atoms[i] for i in sorted(kept_idx)]
 
     if not cap_bonds or not removed_idx:
+        if return_constrained:
+            return kept_atoms, []
         return kept_atoms
 
     # ---- 2. Build bond list on full atom set ----
     bonds = _build_bond_list(atoms)
 
     # ---- 3. For each kept atom bonded to a removed atom, add H cap ----
+    # Map original index → 0-based position in kept_atoms (for serial calculation)
+    orig_to_kept_pos = {ki: pos for pos, ki in enumerate(sorted(kept_idx))}
     cap_atoms: List[Atom] = []
     cap_serial = max(a.serial for a in atoms) + 1
+    boundary_kept_serials: List[int] = []  # 1-based serials of cut-site kept atoms
+
     for ki in sorted(kept_idx):
         kept_atom = atoms[ki]
         for ri in bonds[ki]:
             if ri not in removed_idx:
                 continue
             removed_atom = atoms[ri]
+
+            # Always track the kept boundary atom for constraint generation
+            # (independent of backbone_cuts_only, which only governs cap placement).
+            kept_serial_in_output = orig_to_kept_pos[ki] + 1  # 1-based
+            if kept_serial_in_output not in boundary_kept_serials:
+                boundary_kept_serials.append(kept_serial_in_output)
 
             # When backbone_cuts_only is requested, only place a cap when the
             # severed bond is the intra-residue backbone C–Cα bond.  The cap
@@ -478,4 +524,249 @@ def trim_by_distance(
             cap_atoms.append(cap)
             cap_serial += 1
 
-    return kept_atoms + cap_atoms
+    result_atoms = kept_atoms + cap_atoms
+
+    if return_constrained:
+        # Cap H serials follow all kept_atoms in the output PDB (1-based)
+        cap_serials = [len(kept_atoms) + j + 1 for j in range(len(cap_atoms))]
+        all_constrained = sorted(set(boundary_kept_serials + cap_serials))
+        return result_atoms, all_constrained
+    return result_atoms
+
+
+# ---------------------------------------------------------------------------
+# PSF charge reader
+# ---------------------------------------------------------------------------
+
+def read_charge_from_psf(psf_file: str) -> int:
+    """Read the total formal charge from a CHARMM/NAMD PSF file.
+
+    Parses the ``!NATOM`` section, sums the partial charges in column 7
+    (1-indexed), and rounds the result to the nearest integer.  A
+    :class:`UserWarning` is raised when the sum deviates from an integer by
+    more than 0.01 elementary charge units.
+
+    Parameters
+    ----------
+    psf_file:
+        Path to the PSF file (XPLOR or CHARMM format).
+
+    Returns
+    -------
+    Total charge rounded to the nearest integer.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *psf_file* does not exist.
+    ValueError
+        If the ``!NATOM`` section cannot be found or parsed.
+    """
+    import warnings as _warnings
+
+    psf_path = Path(psf_file)
+    if not psf_path.exists():
+        raise FileNotFoundError(f"PSF file not found: {psf_file}")
+
+    total_charge: float = 0.0
+    natoms: int = 0
+    in_atom_section: bool = False
+    atoms_read: int = 0
+
+    with open(psf_path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if not in_atom_section:
+                # Look for "<N> !NATOM" (optionally with descriptors after)
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].startswith("!NATOM"):
+                    try:
+                        natoms = int(parts[0])
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Could not parse atom count from PSF line: {line!r}"
+                        ) from exc
+                    in_atom_section = True
+                continue
+
+            if atoms_read >= natoms:
+                break
+            if not line.strip():
+                continue
+
+            # XPLOR PSF atom line (free-format, space-separated):
+            # serial  segid  resid  resname  atomname  atomtype  charge  mass  0
+            parts = line.split()
+            if len(parts) < 7:
+                continue
+            try:
+                total_charge += float(parts[6])
+            except ValueError:
+                continue
+            atoms_read += 1
+
+    if natoms == 0:
+        raise ValueError(f"No !NATOM section found in PSF file: {psf_file}")
+
+    fractional = abs(total_charge - round(total_charge))
+    if fractional > 0.01:
+        _warnings.warn(
+            f"PSF charge sum ({total_charge:.4f}) deviates from the nearest integer "
+            f"({round(total_charge):+d}) by {fractional:.4f} e. "
+            "Check that the PSF is complete and all residues are correctly patched.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    return int(round(total_charge))
+
+
+def infer_charge_from_psf_atoms(psf_file: str, atoms: List[Atom]) -> int:
+    """Estimate the formal charge of a subset of atoms using PSF partial charges.
+
+    Matches each atom in *atoms* to the PSF by ``(resseq, resname, atomname)``
+    and sums the corresponding partial charges.  Artificial hydrogen cap atoms
+    (name ``HC``, placed by :func:`trim_by_distance`) are skipped because they
+    are not in the PSF and carry zero formal charge.
+
+    Parameters
+    ----------
+    psf_file:
+        Path to the CHARMM/NAMD PSF file.
+    atoms:
+        Atoms whose charge contribution is to be summed (e.g. trimmed protein
+        atoms including any HC caps).
+
+    Returns
+    -------
+    Total formal charge rounded to the nearest integer, with a
+    :class:`UserWarning` when the sum deviates from an integer by more than
+    0.01 e, or when atoms could not be matched.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *psf_file* does not exist.
+    """
+    import warnings as _warnings
+
+    psf_path = Path(psf_file)
+    if not psf_path.exists():
+        raise FileNotFoundError(f"PSF file not found: {psf_file}")
+
+    # Parse PSF once: {(resid_int, resname, atomname): partial_charge}
+    psf_charges: Dict[Tuple[int, str, str], float] = {}
+    natoms: int = 0
+    in_atom_section: bool = False
+    atoms_read: int = 0
+
+    with open(psf_path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if not in_atom_section:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].startswith("!NATOM"):
+                    try:
+                        natoms = int(parts[0])
+                    except ValueError:
+                        continue
+                    in_atom_section = True
+                continue
+            if atoms_read >= natoms:
+                break
+            if not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) < 7:
+                continue
+            try:
+                key: Tuple[int, str, str] = (
+                    int(parts[2]),
+                    parts[3].strip(),
+                    parts[4].strip(),
+                )
+                psf_charges[key] = float(parts[6])
+            except (ValueError, IndexError):
+                continue
+            atoms_read += 1
+
+    total_charge: float = 0.0
+    unmatched: int = 0
+    for atom in atoms:
+        atomname = atom.name.strip()
+        if atomname == "HC":
+            # Artificial cap hydrogen: not in PSF, carries zero formal charge.
+            continue
+        key = (atom.resseq, atom.resname.strip(), atomname)
+        if key in psf_charges:
+            total_charge += psf_charges[key]
+        else:
+            unmatched += 1
+
+    if unmatched > 0:
+        _warnings.warn(
+            f"{unmatched} atom(s) in the trimmed region could not be matched in "
+            f"PSF '{psf_file}' and are excluded from the charge sum. "
+            "Check that atom names and residue numbering are consistent between "
+            "the PDB and PSF.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    fractional = abs(total_charge - round(total_charge))
+    if fractional > 0.01:
+        _warnings.warn(
+            f"Trimmed-region PSF charge sum ({total_charge:.4f}) deviates from "
+            f"the nearest integer ({round(total_charge):+d}) by {fractional:.4f} e.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    return int(round(total_charge))
+
+
+# ---------------------------------------------------------------------------
+# xTB constraint file
+# ---------------------------------------------------------------------------
+
+def write_xcontrol(
+    constrained_serials: List[int],
+    output_path: str,
+    force_constant: float = 0.5,
+) -> None:
+    """Write an xTB xcontrol file that constrains boundary and cap atoms.
+
+    Generates a ``$constrain`` block that harmonically restrains the listed
+    atoms to their input coordinates during the GFN-FF geometry optimisation.
+    This is used when relaxing a trimmed complex so that the backbone C atoms
+    at cut sites and the artificial H cap atoms do not drift away from their
+    crystallographic positions.
+
+    The force constant is specified in Eh/Bohr² (xTB default units).
+
+    Parameters
+    ----------
+    constrained_serials:
+        1-based atom serial numbers (in the output PDB written by
+        :func:`write_pdb`) that should be harmonically constrained.  These
+        are the boundary kept atoms and all H cap atoms.
+    output_path:
+        Path where the xcontrol file will be written.
+    force_constant:
+        Harmonic force constant in Eh/Bohr² (default 0.5).
+
+    References
+    ----------
+    https://xtb-docs.readthedocs.io/en/latest/xcontrol.html#fixing-constraining-and-confining
+    """
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as fh:
+        if constrained_serials:
+            atom_list = ",".join(map(str, constrained_serials))
+            fh.write(f"$constrain\n")
+            fh.write(f"   force constant={force_constant}\n")
+            fh.write(f"   atoms: {atom_list}\n")
+            fh.write(f"$end\n")
+        else:
+            # No constraints — write an empty (but valid) xcontrol file
+            fh.write("# No constrained atoms\n")

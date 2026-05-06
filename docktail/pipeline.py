@@ -40,12 +40,15 @@ from .analysis import (
 from .config import DocktailConfig
 from .preprocessing import (
     Atom,
+    infer_charge_from_psf_atoms,
     infer_ligand_charge,
     merge_protein_ligand,
     parse_pdb,
+    read_charge_from_psf,
     strip_solvent,
     trim_by_distance,
     write_pdb,
+    write_xcontrol,
 )
 from .reporting import write_csv, write_report
 from .slurm import generate_ligand_jobs, submit_job
@@ -138,6 +141,28 @@ def prepare(cfg: DocktailConfig) -> List[str]:
     pairs = _discover_pairs(cfg.input_dir, cfg.protein_pattern, cfg.ligand_pattern)
 
     # ------------------------------------------------------------------
+    # Protein charge: PSF overrides explicit protein_charge when provided
+    # ------------------------------------------------------------------
+    if cfg.protein_psf:
+        cfg.protein_charge = read_charge_from_psf(cfg.protein_psf)
+        warnings.warn(
+            f"Protein charge estimated from PSF '{cfg.protein_psf}': "
+            f"{cfg.protein_charge:+d}. Review before submitting.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    if cfg.trim and not cfg.protein_psf:
+        warnings.warn(
+            "Trimming is enabled but 'protein_psf' is not set. "
+            "The protein charge for trimmed structures will default to 'protein_charge' "
+            "which may not match the actual charge of the trimmed region. "
+            "Consider providing a PSF file for automatic trimmed-charge estimation.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    # ------------------------------------------------------------------
     # Per-ligand charge inference (optional)
     # ------------------------------------------------------------------
     ligand_charges: Dict[str, int] = {}
@@ -206,27 +231,97 @@ def prepare(cfg: DocktailConfig) -> List[str]:
 
         # ---- Trimmed / full files for SP when relax=False ----
         # complex.pdb / protein.pdb are the SP inputs used when no GFN-FF
-        # relaxation is performed.  When relax=True, SP inputs are written by
-        # trim_relaxed_structures() after the GFN-FF run.
+        # relaxation is performed.  When relax=True and relax_trimmed=False,
+        # SP inputs are written by trim_relaxed_structures() after the GFN-FF
+        # run.  When relax_trimmed=True, complex.pdb is also the relax input.
         if cfg.trim:
-            trimmed = trim_by_distance(
+            # Use a larger cutoff when building the region for GFN-FF relaxation
+            # so that boundary constraints act on atoms further from the core.
+            relax_cutoff = cfg.relax_trim_cutoff if cfg.relax_trimmed else cfg.trim_cutoff
+            trimmed_result = trim_by_distance(
                 full_atoms,
                 ligand_resname=ligand_resname,
-                cutoff=cfg.trim_cutoff,
+                cutoff=relax_cutoff,
                 cap_bonds=cfg.cap_bonds,
                 trim_level=cfg.trim_level,
                 exclude_solvent=cfg.exclude_solvent,
                 backbone_cuts_only=cfg.backbone_cuts_only,
+                return_constrained=cfg.relax_trimmed,
             )
+            if cfg.relax_trimmed:
+                trimmed, constrained_serials = trimmed_result
+                write_xcontrol(
+                    constrained_serials,
+                    str(lig_dir / "relax_constraints.inp"),
+                )
+            else:
+                trimmed = trimmed_result
             write_pdb(trimmed, str(lig_dir / "complex.pdb"))
             prot_trimmed = [
                 a for a in trimmed
                 if a.resname.strip().upper() != ligand_resname.upper()
             ]
             write_pdb(prot_trimmed, str(lig_dir / "protein.pdb"))
+
+            # ---- Compute trimmed-region protein charges ----
+            # The SP region is always at trim_cutoff (6Å); the relax region may
+            # be larger (relax_trim_cutoff, e.g. 8Å).  Charges are computed now
+            # from PSF partial charges so SLURM scripts embed the correct value.
+            if cfg.protein_psf:
+                if cfg.relax_trimmed:
+                    # Charge for the 8Å relax region
+                    relax_prot_charge = infer_charge_from_psf_atoms(
+                        cfg.protein_psf, prot_trimmed
+                    )
+                    (lig_dir / "relax_protein_charge.txt").write_text(
+                        str(relax_prot_charge)
+                    )
+                    warnings.warn(
+                        f"Ligand '{name}': relax-region protein charge "
+                        f"(PSF, {relax_cutoff:.1f} Å): {relax_prot_charge:+d}.",
+                        UserWarning, stacklevel=2,
+                    )
+                    # Charge for the 6Å SP region (re-trim without constraints)
+                    sp_trimmed_6a = trim_by_distance(
+                        full_atoms,
+                        ligand_resname=ligand_resname,
+                        cutoff=cfg.trim_cutoff,
+                        cap_bonds=cfg.cap_bonds,
+                        trim_level=cfg.trim_level,
+                        exclude_solvent=cfg.exclude_solvent,
+                        backbone_cuts_only=cfg.backbone_cuts_only,
+                    )
+                    prot_sp_6a = [
+                        a for a in sp_trimmed_6a
+                        if a.resname.strip().upper() != ligand_resname.upper()
+                    ]
+                    sp_prot_charge = infer_charge_from_psf_atoms(
+                        cfg.protein_psf, prot_sp_6a
+                    )
+                else:
+                    # The trimmed region IS the SP region
+                    sp_prot_charge = infer_charge_from_psf_atoms(
+                        cfg.protein_psf, prot_trimmed
+                    )
+                (lig_dir / "sp_protein_charge.txt").write_text(str(sp_prot_charge))
+                warnings.warn(
+                    f"Ligand '{name}': SP-region protein charge "
+                    f"(PSF, {cfg.trim_cutoff:.1f} Å): {sp_prot_charge:+d}.",
+                    UserWarning, stacklevel=2,
+                )
+            else:
+                # No PSF: fall back to cfg.protein_charge for all trimmed regions
+                (lig_dir / "sp_protein_charge.txt").write_text(
+                    str(cfg.protein_charge)
+                )
+                if cfg.relax_trimmed:
+                    (lig_dir / "relax_protein_charge.txt").write_text(
+                        str(cfg.protein_charge)
+                    )
         else:
             copy2(complex_full_pdb, str(lig_dir / "complex.pdb"))
             copy2(str(lig_dir / "protein_full.pdb"), str(lig_dir / "protein.pdb"))
+            # No trimming: charge files not needed (cfg.protein_charge is correct)
 
     ligand_names = [name for name, _, _ in pairs]
     # Save a copy of the effective config so SLURM scripts can reference it
@@ -288,7 +383,20 @@ def trim_relaxed_structures(lig_dir: Path, cfg: DocktailConfig) -> None:
 
     complex_atoms = parse_pdb(relaxed_complex_pdb)
 
-    if cfg.trim:
+    if cfg.relax_trimmed:
+        # The relaxed complex was trimmed at relax_trim_cutoff (e.g. 8 Å).  Re-trim
+        # it to the SP cutoff (trim_cutoff, e.g. 6 Å) so that single-point scoring
+        # uses the same region size as the non-relax_trimmed workflow.
+        sp_atoms = trim_by_distance(
+            complex_atoms,
+            ligand_resname=ligand_resname,
+            cutoff=cfg.trim_cutoff,
+            cap_bonds=cfg.cap_bonds,
+            trim_level=cfg.trim_level,
+            exclude_solvent=cfg.exclude_solvent,
+            backbone_cuts_only=cfg.backbone_cuts_only,
+        )
+    elif cfg.trim:
         sp_atoms = trim_by_distance(
             complex_atoms,
             ligand_resname=ligand_resname,
@@ -316,14 +424,25 @@ def trim_relaxed_structures(lig_dir: Path, cfg: DocktailConfig) -> None:
     write_pdb(lig_atoms, str(lig_dir / "sp_ligand.pdb"))
 
     if cfg.oniom:
-        # Full (untrimed) relaxed complex and protein for GFN-FF ONIOM SP
         from shutil import copy2 as _copy2
-        _copy2(relaxed_complex_pdb, str(lig_dir / "full_complex.pdb"))
-        full_prot_atoms = [
-            a for a in complex_atoms
-            if a.resname.strip().upper() != ligand_resname.upper()
-        ]
-        write_pdb(full_prot_atoms, str(lig_dir / "full_protein.pdb"))
+        if cfg.relax_trimmed:
+            # ONIOM correction uses the original unrelaxed full complex
+            # (written by prepare()) so that the geometry is consistent with
+            # the unrelaxed trimmed structure used for the FF correction terms.
+            _copy2(str(lig_dir / "complex_full.pdb"), str(lig_dir / "full_complex.pdb"))
+            full_prot_unrelaxed = [
+                a for a in parse_pdb(str(lig_dir / "complex_full.pdb"))
+                if a.resname.strip().upper() != ligand_resname.upper()
+            ]
+            write_pdb(full_prot_unrelaxed, str(lig_dir / "full_protein.pdb"))
+        else:
+            # ONIOM correction uses the relaxed full complex (xtbopt.pdb)
+            _copy2(relaxed_complex_pdb, str(lig_dir / "full_complex.pdb"))
+            full_prot_atoms = [
+                a for a in complex_atoms
+                if a.resname.strip().upper() != ligand_resname.upper()
+            ]
+            write_pdb(full_prot_atoms, str(lig_dir / "full_protein.pdb"))
 
 
 # ---------------------------------------------------------------------------
@@ -483,9 +602,18 @@ def _warn_missing_energies(
         out_file = str(lig_dir / subdir / "xtb.out")
         status = check_xtb_termination(out_file)
         if status == "abnormal":
+            # Check specifically for SCF convergence failure
+            _scf_msg = ""
+            if os.path.isfile(out_file):
+                from .xtb_runner import _SCF_FAILED_RE
+                with open(out_file) as _fh:
+                    _txt = _fh.read()
+                if _SCF_FAILED_RE.search(_txt):
+                    _scf_msg = " (SCF did not converge — consider increasing xtb_scf_iterations or checking system charge)"
             warnings.warn(
-                f"Ligand '{name}': xTB {label} calculation terminated abnormally "
-                f"({out_file}). Binding energy will be skipped.",
+                f"Ligand '{name}': xTB {label} calculation terminated abnormally"
+                + _scf_msg
+                + f" ({out_file}). Binding energy will be skipped.",
                 RuntimeWarning,
                 stacklevel=4,
             )
@@ -611,8 +739,24 @@ def _run_xtb_for_ligand(
     if ligand_charge is None:
         ligand_charge = cfg.ligand_charge
 
-    complex_charge = cfg.protein_charge + ligand_charge
-    complex_uhf = cfg.protein_uhf + cfg.ligand_uhf
+    # Read trimmed protein charges written by prepare() if available;
+    # otherwise fall back to cfg.protein_charge (correct for no-trim case).
+    _sp_charge_file = lig_dir / "sp_protein_charge.txt"
+    sp_prot_charge = (
+        int(_sp_charge_file.read_text().strip())
+        if _sp_charge_file.exists()
+        else cfg.protein_charge
+    )
+    _relax_charge_file = lig_dir / "relax_protein_charge.txt"
+    relax_prot_charge = (
+        int(_relax_charge_file.read_text().strip())
+        if _relax_charge_file.exists()
+        else cfg.protein_charge
+    )
+
+    relax_complex_charge = relax_prot_charge + ligand_charge
+    sp_complex_charge    = sp_prot_charge + ligand_charge
+    complex_uhf          = cfg.protein_uhf + cfg.ligand_uhf
 
     complex_full_pdb = str(lig_dir / "complex_full.pdb")
     protein_full_pdb = str(lig_dir / "protein_full.pdb")
@@ -624,15 +768,30 @@ def _run_xtb_for_ligand(
     if cfg.relax:
         relax_complex_dir = str(lig_dir / "relax_complex")
 
-        # Relax the full complex (no trimming) so GFN-FF sees a complete
-        # molecular graph without disconnected fragments at cap sites.
+        # Choose input for GFN-FF relaxation
+        if cfg.relax_trimmed:
+            # Relax only the trimmed region with harmonic constraints on
+            # boundary C atoms and H caps (prevents cap drift, keeps boundary
+            # consistent with the outer-shell correction).
+            if not cfg.trim:
+                raise ValueError(
+                    "relax_trimmed=True requires trim=True. "
+                    "Enable trimming in the configuration."
+                )
+            relax_input = str(lig_dir / "complex.pdb")
+            xcontrol = str(lig_dir / "relax_constraints.inp")
+        else:
+            relax_input = complex_full_pdb
+            xcontrol = None
+
         relax_structure(
-            complex_full_pdb, relax_complex_dir,
+            relax_input, relax_complex_dir,
             method=cfg.relax_method,
-            charge=complex_charge,
+            charge=relax_complex_charge,
             uhf=complex_uhf,
             xtb_exe=cfg.xtb_exe,
             xtb_mode=cfg.xtb_mode,
+            xcontrol_file=xcontrol,
         )
 
         # Separate protein/ligand from the relaxed complex and trim for SP scoring
@@ -651,22 +810,24 @@ def _run_xtb_for_ligand(
     single_point_energy(
         complex_pdb_sp, str(lig_dir / "sp_complex"),
         method=cfg.method,
-        charge=complex_charge,
+        charge=sp_complex_charge,
         uhf=complex_uhf,
         xtb_exe=cfg.xtb_exe,
         xtb_mode=cfg.xtb_mode,
         solvent=score_solvent,
         solvent_model=cfg.solvent_model,
+        max_iterations=cfg.xtb_scf_iterations,
     )
     single_point_energy(
         protein_pdb_sp, str(lig_dir / "sp_protein"),
         method=cfg.method,
-        charge=cfg.protein_charge,
+        charge=sp_prot_charge,
         uhf=cfg.protein_uhf,
         xtb_exe=cfg.xtb_exe,
         xtb_mode=cfg.xtb_mode,
         solvent=score_solvent,
         solvent_model=cfg.solvent_model,
+        max_iterations=cfg.xtb_scf_iterations,
     )
     single_point_energy(
         ligand_pdb_sp, str(lig_dir / "sp_ligand"),
@@ -677,16 +838,26 @@ def _run_xtb_for_ligand(
         xtb_mode=cfg.xtb_mode,
         solvent=score_solvent,
         solvent_model=cfg.solvent_model,
+        max_iterations=cfg.xtb_scf_iterations,
     )
 
     if cfg.oniom:
         # deltaE_oniom = deltaE_gfnff(full) - deltaE_gfnff(trimmed) + deltaE_gfn2(trimmed)
         if cfg.relax:
+            # full_complex.pdb / full_protein.pdb written by trim_relaxed_structures()
             full_complex_oniom = str(lig_dir / "full_complex.pdb")
             full_protein_oniom = str(lig_dir / "full_protein.pdb")
-            trim_complex_oniom = str(lig_dir / "sp_complex.pdb")
-            trim_protein_oniom = str(lig_dir / "sp_protein.pdb")
-            lig_oniom          = str(lig_dir / "sp_ligand.pdb")
+            if cfg.relax_trimmed:
+                # Trimmed reference = pre-relaxation trimmed files from prepare()
+                # Ligand = original unrelaxed geometry
+                trim_complex_oniom = str(lig_dir / "complex.pdb")
+                trim_protein_oniom = str(lig_dir / "protein.pdb")
+                lig_oniom          = ligand_pdb
+            else:
+                # Trimmed reference = trimmed from the relaxed full complex
+                trim_complex_oniom = str(lig_dir / "sp_complex.pdb")
+                trim_protein_oniom = str(lig_dir / "sp_protein.pdb")
+                lig_oniom          = str(lig_dir / "sp_ligand.pdb")
         else:
             full_complex_oniom = complex_full_pdb
             full_protein_oniom = protein_full_pdb
@@ -697,7 +868,7 @@ def _run_xtb_for_ligand(
         single_point_energy(
             full_complex_oniom, str(lig_dir / "oniom_ff_full_complex"),
             method=cfg.oniom_mm_method,
-            charge=complex_charge,
+            charge=cfg.protein_charge + ligand_charge,
             uhf=complex_uhf,
             xtb_exe=cfg.xtb_exe,
             xtb_mode=cfg.xtb_mode,
@@ -721,7 +892,7 @@ def _run_xtb_for_ligand(
         single_point_energy(
             trim_complex_oniom, str(lig_dir / "oniom_ff_trim_complex"),
             method=cfg.oniom_mm_method,
-            charge=complex_charge,
+            charge=sp_complex_charge,
             uhf=complex_uhf,
             xtb_exe=cfg.xtb_exe,
             xtb_mode=cfg.xtb_mode,
@@ -729,7 +900,7 @@ def _run_xtb_for_ligand(
         single_point_energy(
             trim_protein_oniom, str(lig_dir / "oniom_ff_trim_protein"),
             method=cfg.oniom_mm_method,
-            charge=cfg.protein_charge,
+            charge=sp_prot_charge,
             uhf=cfg.protein_uhf,
             xtb_exe=cfg.xtb_exe,
             xtb_mode=cfg.xtb_mode,

@@ -46,6 +46,10 @@ _GFNFF_ENERGY_RE = re.compile(
     r"TOTAL ENERGY\s+([-\d.]+)\s+Eh"
 )
 _ABNORMAL_RE = re.compile(r"ABNORMAL TERMINATION")
+_SCF_FAILED_RE = re.compile(
+    r"convergence criteria cannot be satisfied|SCF not converged|did not converge",
+    re.IGNORECASE,
+)
 
 # Bohr ↔ Angstrom conversion
 _BOHR_TO_ANG = 0.529177210903
@@ -121,6 +125,8 @@ def _build_cmd(
     extra_flags: Optional[list[str]] = None,
     solvent: Optional[str] = None,
     solvent_model: str = "gbsa",
+    xcontrol_file: Optional[str] = None,
+    max_iterations: Optional[int] = None,
 ) -> list[str]:
     pdb_abs = str(Path(pdb_file).resolve())
     cmd = [xtb_exe, pdb_abs] + _xtb_method_flag(method)
@@ -128,6 +134,10 @@ def _build_cmd(
         cmd += ["--opt"]
     cmd += ["--chrg", str(charge), "--uhf", str(uhf)]
     cmd += _solvent_flags(method, solvent, solvent_model)
+    if xcontrol_file:
+        cmd += ["--input", str(Path(xcontrol_file).resolve())]
+    if max_iterations is not None and max_iterations != 250:
+        cmd += ["--iterations", str(max_iterations)]
     if extra_flags:
         cmd += extra_flags
     return cmd
@@ -395,6 +405,7 @@ def relax_structure(
     xtb_mode: str = "cli",
     solvent: Optional[str] = None,
     solvent_model: str = "gbsa",
+    xcontrol_file: Optional[str] = None,
 ) -> tuple[Optional[float], str]:
     """Run a GFN-FF (or other method) geometry optimisation.
 
@@ -420,6 +431,11 @@ def relax_structure(
         for gas phase.  Applied only for GFN-*n* methods.
     solvent_model:
         Solvation model: ``"gbsa"`` (default) or ``"alpb"`` (CLI only).
+    xcontrol_file:
+        Path to an xTB xcontrol (input) file.  When provided, ``--input
+        <path>`` is appended to the CLI command.  Use this to pass
+        ``$constrain`` or ``$fix`` blocks when relaxing a trimmed complex
+        with constrained boundary atoms.  Ignored in API mode.
 
     Returns
     -------
@@ -432,7 +448,8 @@ def relax_structure(
 
     # --- CLI mode ---
     cmd = _build_cmd(xtb_exe, pdb_file, method, charge, uhf, opt=True,
-                     solvent=solvent, solvent_model=solvent_model)
+                     solvent=solvent, solvent_model=solvent_model,
+                     xcontrol_file=xcontrol_file)
     returncode = _run_xtb(cmd, work_dir)
     out_file = str(Path(work_dir) / "xtb.out")
     energy = parse_xtb_energy(out_file)
@@ -472,6 +489,7 @@ def single_point_energy(
     xtb_mode: str = "cli",
     solvent: Optional[str] = None,
     solvent_model: str = "gbsa",
+    max_iterations: Optional[int] = None,
 ) -> Optional[float]:
     """Run a single-point xTB energy calculation.
 
@@ -509,7 +527,8 @@ def single_point_energy(
 
     # --- CLI mode ---
     cmd = _build_cmd(xtb_exe, pdb_file, method, charge, uhf, opt=False,
-                     solvent=solvent, solvent_model=solvent_model)
+                     solvent=solvent, solvent_model=solvent_model,
+                     max_iterations=max_iterations)
     returncode = _run_xtb(cmd, work_dir)
     out_file = str(Path(work_dir) / "xtb.out")
     energy = parse_xtb_energy(out_file)
@@ -520,4 +539,23 @@ def single_point_energy(
         )
         warnings.warn(msg, RuntimeWarning, stacklevel=2)
         raise RuntimeError(msg)
+    # Detect SCF convergence failure (exit code may still be 0)
+    if energy is None and os.path.isfile(out_file):
+        with open(out_file) as _fh:
+            _content = _fh.read()
+        if _SCF_FAILED_RE.search(_content):
+            warnings.warn(
+                f"xTB single-point SCF did not converge in {work_dir}. "
+                f"Energy will be missing. Consider increasing xtb_scf_iterations "
+                f"(current: {max_iterations or 250}) or checking the system charge.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        elif _ABNORMAL_RE.search(_content):
+            warnings.warn(
+                f"xTB single-point terminated abnormally in {work_dir}. "
+                "Energy will be missing.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     return energy
