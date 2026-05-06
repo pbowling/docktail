@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -103,6 +104,17 @@ class DocktailConfig:
     def complex_uhf(self) -> int:
         """Total uhf (unpaired electrons) for the PL complex."""
         return self.protein_uhf + self.ligand_uhf
+
+    def to_yaml(self) -> str:
+        """Serialize this configuration to a YAML string."""
+        d = dataclasses.asdict(self)
+        return yaml.dump(d, default_flow_style=False, sort_keys=False)
+
+    def save_yaml(self, path: str) -> None:
+        """Write this configuration to a YAML file at *path*."""
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(self.to_yaml())
 
 
 def load_config(path: Optional[str]) -> DocktailConfig:

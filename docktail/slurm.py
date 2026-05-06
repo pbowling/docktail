@@ -27,8 +27,9 @@ _SLURM_TEMPLATE = """\
 #!/bin/bash
 #SBATCH --job-name=${job_name}
 #SBATCH --partition=${partition}
-#SBATCH --ntasks=${nodes}
-#SBATCH --cpus-per-task=${tasks}
+#SBATCH --ntasks=${ntasks}
+#SBATCH --cpus-per-task=${cpus}
+#SBATCH --mem=${memory}
 #SBATCH --time=${time}
 ${account_line}
 ${extra_directives}
@@ -83,8 +84,8 @@ def render_slurm_script(
     return tmpl.safe_substitute(
         job_name=job_name,
         partition=cfg.partition,
-        nodes=cfg.nodes,
-        ntasks=cfg.ntasks,
+        ntasks=cfg.nodes,
+        cpus=cfg.ntasks,
         memory=cfg.memory,
         time=cfg.time,
         account_line=account_line,
@@ -164,13 +165,18 @@ def generate_ligand_jobs(
     output_dir: str,
     cfg: DocktailConfig,
     ligand_charges: Optional[Dict[str, int]] = None,
+    config_path: Optional[str] = None,
 ) -> List[str]:
     """Generate one SLURM script per ligand and return their paths.
 
     The script covers:
-    1. (Optional) GFN-FF relaxation of protein, ligand, and complex.
-    2. GFN2-xTB (or chosen method) single-point on protein, ligand, and complex.
-    3. (Optional) ONIOM subsystem calculations.
+    1. (Optional) GFN-FF relaxation of the full protein+ligand complex,
+       isolated protein, and isolated ligand.
+    2. (Optional, when relax=True) Post-relaxation trimming via
+       ``docktail trim-relaxed`` to produce SP input files.
+    3. GFN2-xTB (or chosen method) single-point on trimmed/full protein,
+       ligand, and complex.
+    4. (Optional) ONIOM subsystem calculations.
 
     Parameters
     ----------
@@ -182,9 +188,12 @@ def generate_ligand_jobs(
         Pipeline configuration.
     ligand_charges:
         Optional mapping of ligand name → formal charge.  When provided,
-        overrides ``cfg.ligand_charge`` on a per-ligand basis.  Use this to
-        pass inferred or explicitly set per-ligand charges from
-        ``pipeline.prepare()``.
+        overrides ``cfg.ligand_charge`` on a per-ligand basis.
+    config_path:
+        Path to the saved config YAML written by ``prepare()``.  Required for
+        the ``docktail trim-relaxed`` step when ``cfg.relax=True``; if
+        ``None``, the trim-relaxed step is skipped (SP will use the
+        pre-relaxation trimmed files instead).
 
     Returns
     -------
@@ -202,10 +211,10 @@ def generate_ligand_jobs(
 
         commands: List[str] = ["# --- Ligand: {} ---".format(name)]
 
-        # Paths (relative to lig_dir) used by xTB – resolved at submit time
-        complex_pdb = str(Path(lig_dir) / "complex.pdb")
-        protein_pdb = str(Path(lig_dir) / "protein.pdb")
-        ligand_pdb = str(Path(lig_dir) / "ligand.pdb")
+        # Full (untrimmmed) inputs for GFN-FF relaxation
+        complex_full_pdb = str(Path(lig_dir) / "complex_full.pdb")
+        protein_full_pdb = str(Path(lig_dir) / "protein_full.pdb")
+        ligand_pdb       = str(Path(lig_dir) / "ligand.pdb")
 
         # Solvation flags for scoring steps (GFN-n) only
         score_solvent = cfg.solvent if cfg.use_solvent_model else None
@@ -216,59 +225,55 @@ def generate_ligand_jobs(
         solvent_str = (" " + " ".join(solvent_flags)) if solvent_flags else ""
 
         if cfg.relax:
-            # GFN-FF optimisation sub-dirs (no solvation for force-field relax)
             relax_pl = str(Path(lig_dir) / "relax_complex")
-            relax_p = str(Path(lig_dir) / "relax_protein")
-            relax_l = str(Path(lig_dir) / "relax_ligand")
 
             commands += [
-                f"mkdir -p {relax_pl} {relax_p} {relax_l}",
-                f"# Relax complex",
-                f"cd {relax_pl} && {cfg.xtb_exe} {complex_pdb} "
+                f"mkdir -p {relax_pl}",
+                f"# Relax complex (full, no trim)",
+                f"cd {relax_pl} && {cfg.xtb_exe} {complex_full_pdb} "
                 + " ".join(_xtb_method_flag_str(cfg.relax_method))
                 + f" --opt --chrg {cplx_charge} --uhf {cplx_uhf}"
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
                 f'if grep -q "ABNORMAL TERMINATION" {relax_pl}/xtb.out; then echo "ERROR: xTB relax (complex) terminated abnormally – skipping scoring" >&2; exit 1; fi',
-                f"# Relax protein",
-                f"cd {relax_p} && {cfg.xtb_exe} {protein_pdb} "
-                + " ".join(_xtb_method_flag_str(cfg.relax_method))
-                + f" --opt --chrg {cfg.protein_charge} --uhf {cfg.protein_uhf}"
-                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
-                f'if grep -q "ABNORMAL TERMINATION" {relax_p}/xtb.out; then echo "ERROR: xTB relax (protein) terminated abnormally – skipping scoring" >&2; exit 1; fi',
-                f"# Relax ligand",
-                f"cd {relax_l} && {cfg.xtb_exe} {ligand_pdb} "
-                + " ".join(_xtb_method_flag_str(cfg.relax_method))
-                + f" --opt --chrg {lig_charge} --uhf {cfg.ligand_uhf}"
-                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
-                f'if grep -q "ABNORMAL TERMINATION" {relax_l}/xtb.out; then echo "ERROR: xTB relax (ligand) terminated abnormally – skipping scoring" >&2; exit 1; fi',
             ]
 
-            # Use relaxed structures for scoring
-            complex_pdb = str(Path(relax_pl) / "xtbopt.pdb")
-            protein_pdb = str(Path(relax_p) / "xtbopt.pdb")
-            ligand_pdb = str(Path(relax_l) / "xtbopt.pdb")
+            if config_path:
+                commands += [
+                    f"# Separate protein/ligand from relaxed complex; trim for SP scoring",
+                    f"docktail trim-relaxed --lig-dir {lig_dir} --config {config_path}",
+                ]
+
+            # SP inputs: separated from relaxed complex by trim-relaxed
+            complex_pdb_sp = str(Path(lig_dir) / "sp_complex.pdb")
+            protein_pdb_sp = str(Path(lig_dir) / "sp_protein.pdb")
+            ligand_pdb_sp  = str(Path(lig_dir) / "sp_ligand.pdb")
+        else:
+            # No relax: SP uses pre-trimmed (or full) structures from prepare()
+            complex_pdb_sp = str(Path(lig_dir) / "complex.pdb")
+            protein_pdb_sp = str(Path(lig_dir) / "protein.pdb")
+            ligand_pdb_sp  = ligand_pdb
 
         # Single-point scoring
         sp_pl = str(Path(lig_dir) / "sp_complex")
-        sp_p = str(Path(lig_dir) / "sp_protein")
-        sp_l = str(Path(lig_dir) / "sp_ligand")
+        sp_p  = str(Path(lig_dir) / "sp_protein")
+        sp_l  = str(Path(lig_dir) / "sp_ligand")
 
         commands += [
             f"mkdir -p {sp_pl} {sp_p} {sp_l}",
             f"# Single-point complex",
-            f"cd {sp_pl} && {cfg.xtb_exe} {complex_pdb} "
+            f"cd {sp_pl} && {cfg.xtb_exe} {complex_pdb_sp} "
             + " ".join(_xtb_method_flag_str(cfg.method))
             + f" --chrg {cplx_charge} --uhf {cplx_uhf}"
             + solvent_str
             + f" > xtb.out 2> xtb.err && cd {lig_dir}",
             f"# Single-point protein",
-            f"cd {sp_p} && {cfg.xtb_exe} {protein_pdb} "
+            f"cd {sp_p} && {cfg.xtb_exe} {protein_pdb_sp} "
             + " ".join(_xtb_method_flag_str(cfg.method))
             + f" --chrg {cfg.protein_charge} --uhf {cfg.protein_uhf}"
             + solvent_str
             + f" > xtb.out 2> xtb.err && cd {lig_dir}",
             f"# Single-point ligand",
-            f"cd {sp_l} && {cfg.xtb_exe} {ligand_pdb} "
+            f"cd {sp_l} && {cfg.xtb_exe} {ligand_pdb_sp} "
             + " ".join(_xtb_method_flag_str(cfg.method))
             + f" --chrg {lig_charge} --uhf {cfg.ligand_uhf}"
             + solvent_str
@@ -276,37 +281,54 @@ def generate_ligand_jobs(
         ]
 
         if cfg.oniom:
-            oniom_qm_dir = str(Path(lig_dir) / "oniom_qm_sub")
-            oniom_mm_super = str(Path(lig_dir) / "oniom_mm_super")
-            oniom_mm_sub = str(Path(lig_dir) / "oniom_mm_sub")
-            sub_pdb = str(Path(lig_dir) / "subsystem.pdb")
-            super_pdb = str(Path(lig_dir) / "complex.pdb")
+            # Determine ONIOM structure paths based on whether relaxation was done
+            if cfg.relax:
+                full_cplx_oniom = str(Path(lig_dir) / "full_complex.pdb")
+                full_prot_oniom = str(Path(lig_dir) / "full_protein.pdb")
+                trim_cplx_oniom = complex_pdb_sp
+                trim_prot_oniom = protein_pdb_sp
+                lig_oniom       = ligand_pdb_sp
+            else:
+                full_cplx_oniom = complex_full_pdb
+                full_prot_oniom = protein_full_pdb
+                trim_cplx_oniom = complex_pdb_sp
+                trim_prot_oniom = protein_pdb_sp
+                lig_oniom       = ligand_pdb
 
-            oniom_qm_solvent_flags = (
-                _solvent_flag_str(cfg.oniom_qm_method, score_solvent, cfg.solvent_model)
-                if score_solvent else []
-            )
-            oniom_qm_solvent_str = (
-                (" " + " ".join(oniom_qm_solvent_flags)) if oniom_qm_solvent_flags else ""
-            )
+            ff_full_cplx_dir = str(Path(lig_dir) / "oniom_ff_full_complex")
+            ff_full_prot_dir = str(Path(lig_dir) / "oniom_ff_full_protein")
+            ff_trim_cplx_dir = str(Path(lig_dir) / "oniom_ff_trim_complex")
+            ff_trim_prot_dir = str(Path(lig_dir) / "oniom_ff_trim_protein")
+            ff_lig_dir       = str(Path(lig_dir) / "oniom_ff_ligand")
+
+            mm_flags = " ".join(_xtb_method_flag_str(cfg.oniom_mm_method))
 
             commands += [
-                f"mkdir -p {oniom_qm_dir} {oniom_mm_super} {oniom_mm_sub}",
-                f"# ONIOM subsystem QM",
-                f"cd {oniom_qm_dir} && {cfg.xtb_exe} {sub_pdb} "
-                + " ".join(_xtb_method_flag_str(cfg.oniom_qm_method))
-                + f" --chrg {lig_charge} --uhf {cfg.ligand_uhf}"
-                + oniom_qm_solvent_str
-                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
-                f"# ONIOM supersystem MM",
-                f"cd {oniom_mm_super} && {cfg.xtb_exe} {super_pdb} "
-                + " ".join(_xtb_method_flag_str(cfg.oniom_mm_method))
+                f"mkdir -p {ff_full_cplx_dir} {ff_full_prot_dir} {ff_trim_cplx_dir} {ff_trim_prot_dir} {ff_lig_dir}",
+                f"# ONIOM GFN-FF SP: full complex",
+                f"cd {ff_full_cplx_dir} && {cfg.xtb_exe} {full_cplx_oniom} "
+                + mm_flags
                 + f" --chrg {cplx_charge} --uhf {cplx_uhf}"
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
-                f"# ONIOM subsystem MM",
-                f"cd {oniom_mm_sub} && {cfg.xtb_exe} {sub_pdb} "
-                + " ".join(_xtb_method_flag_str(cfg.oniom_mm_method))
+                f"# ONIOM GFN-FF SP: full protein",
+                f"cd {ff_full_prot_dir} && {cfg.xtb_exe} {full_prot_oniom} "
+                + mm_flags
+                + f" --chrg {cfg.protein_charge} --uhf {cfg.protein_uhf}"
+                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+                f"# ONIOM GFN-FF SP: ligand",
+                f"cd {ff_lig_dir} && {cfg.xtb_exe} {lig_oniom} "
+                + mm_flags
                 + f" --chrg {lig_charge} --uhf {cfg.ligand_uhf}"
+                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+                f"# ONIOM GFN-FF SP: trimmed complex",
+                f"cd {ff_trim_cplx_dir} && {cfg.xtb_exe} {trim_cplx_oniom} "
+                + mm_flags
+                + f" --chrg {cplx_charge} --uhf {cplx_uhf}"
+                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+                f"# ONIOM GFN-FF SP: trimmed protein",
+                f"cd {ff_trim_prot_dir} && {cfg.xtb_exe} {trim_prot_oniom} "
+                + mm_flags
+                + f" --chrg {cfg.protein_charge} --uhf {cfg.protein_uhf}"
                 + f" > xtb.out 2> xtb.err && cd {lig_dir}",
             ]
 

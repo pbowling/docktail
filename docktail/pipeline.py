@@ -35,7 +35,6 @@ import pandas as pd
 from .analysis import (
     HA_TO_KCAL,
     binding_energy,
-    oniom_energy,
     rerank,
 )
 from .config import DocktailConfig
@@ -44,6 +43,7 @@ from .preprocessing import (
     infer_ligand_charge,
     merge_protein_ligand,
     parse_pdb,
+    strip_solvent,
     trim_by_distance,
     write_pdb,
 )
@@ -171,18 +171,46 @@ def prepare(cfg: DocktailConfig) -> List[str]:
 
         ligand_resname = _infer_ligand_resname(ligand_pdb)
 
-        # ---- Merge protein + ligand → complex ----
-        complex_pdb = str(lig_dir / "complex.pdb")
-        merge_protein_ligand(protein_pdb, ligand_pdb, complex_pdb)
+        # Save ligand resname so post-relaxation trimming can look it up
+        (lig_dir / "ligand_resname.txt").write_text(ligand_resname)
 
-        # ---- Copy / trim protein and ligand ----
-        proc_protein = str(lig_dir / "protein.pdb")
-        proc_ligand = str(lig_dir / "ligand.pdb")
+        # ---- Merge protein + ligand → full complex (solvent stripped) ----
+        # complex_full.pdb is used for GFN-FF relaxation; keeping solvent out
+        # avoids topology issues and reduces the system to protein+ligand only.
+        complex_full_pdb = str(lig_dir / "complex_full.pdb")
+        merge_protein_ligand(protein_pdb, ligand_pdb, complex_full_pdb)
+        full_atoms = strip_solvent(parse_pdb(complex_full_pdb))
+        write_pdb(full_atoms, complex_full_pdb)
 
+        n_full = len(full_atoms)
+        if n_full > 5000:
+            warnings.warn(
+                f"Ligand '{name}': full complex has {n_full} atoms. "
+                "GFN-FF relaxation of this system may be very slow or exceed "
+                "available memory. Consider increasing trim_cutoff and "
+                "reviewing the receptor before submitting.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # Full protein (no solvent) for GFN-FF relaxation
+        prot_full_atoms = [
+            a for a in full_atoms
+            if a.resname.strip().upper() != ligand_resname.upper()
+        ]
+        write_pdb(prot_full_atoms, str(lig_dir / "protein_full.pdb"))
+
+        # Ligand (unchanged) for GFN-FF relaxation and fall-through SP
+        from shutil import copy2
+        copy2(ligand_pdb, str(lig_dir / "ligand.pdb"))
+
+        # ---- Trimmed / full files for SP when relax=False ----
+        # complex.pdb / protein.pdb are the SP inputs used when no GFN-FF
+        # relaxation is performed.  When relax=True, SP inputs are written by
+        # trim_relaxed_structures() after the GFN-FF run.
         if cfg.trim:
-            complex_atoms = parse_pdb(complex_pdb)
             trimmed = trim_by_distance(
-                complex_atoms,
+                full_atoms,
                 ligand_resname=ligand_resname,
                 cutoff=cfg.trim_cutoff,
                 cap_bonds=cfg.cap_bonds,
@@ -191,37 +219,23 @@ def prepare(cfg: DocktailConfig) -> List[str]:
                 backbone_cuts_only=cfg.backbone_cuts_only,
             )
             write_pdb(trimmed, str(lig_dir / "complex.pdb"))
-
-            # Trimmed protein = trimmed complex minus ligand atoms
-            prot_atoms = [
+            prot_trimmed = [
                 a for a in trimmed
                 if a.resname.strip().upper() != ligand_resname.upper()
             ]
-            write_pdb(prot_atoms, proc_protein)
-
-            # Ligand is never trimmed
-            from shutil import copy2
-            copy2(ligand_pdb, proc_ligand)
+            write_pdb(prot_trimmed, str(lig_dir / "protein.pdb"))
         else:
-            from shutil import copy2
-            copy2(protein_pdb, proc_protein)
-            copy2(ligand_pdb, proc_ligand)
-
-        # ---- ONIOM subsystem file ----
-        if cfg.oniom:
-            _prepare_oniom_subsystem(
-                lig_dir=str(lig_dir),
-                complex_pdb=str(lig_dir / "complex.pdb"),
-                ligand_resname=ligand_resname,
-                qm_cutoff=cfg.oniom_qm_cutoff,
-                cap_bonds=cfg.cap_bonds,
-                exclude_solvent=cfg.exclude_solvent,
-                backbone_cuts_only=cfg.backbone_cuts_only,
-            )
+            copy2(complex_full_pdb, str(lig_dir / "complex.pdb"))
+            copy2(str(lig_dir / "protein_full.pdb"), str(lig_dir / "protein.pdb"))
 
     ligand_names = [name for name, _, _ in pairs]
+    # Save a copy of the effective config so SLURM scripts can reference it
+    # (e.g. for the post-relaxation trim-relaxed step).
+    config_path = str(out_dir / "_docktail_cfg.yaml")
+    cfg.save_yaml(config_path)
     scripts = generate_ligand_jobs(ligand_names, str(out_dir), cfg,
-                                   ligand_charges=ligand_charges)
+                                   ligand_charges=ligand_charges,
+                                   config_path=config_path)
     return scripts
 
 
@@ -248,6 +262,68 @@ def _prepare_oniom_subsystem(
     sub_pdb = str(Path(lig_dir) / "subsystem.pdb")
     write_pdb(sub_atoms, sub_pdb)
     return sub_pdb
+
+
+def trim_relaxed_structures(lig_dir: Path, cfg: DocktailConfig) -> None:
+    """Trim the GFN-FF-relaxed complex and protein for xTB single-point scoring.
+
+    Called after GFN-FF optimisation completes (either in-process or from the
+    ``docktail trim-relaxed`` CLI command inside a SLURM script).  Reads the
+    optimised structures from ``relax_complex/xtbopt.pdb`` and
+    ``relax_protein/xtbopt.pdb``, applies the configured trimming, and writes:
+
+    * ``sp_complex.pdb``  – trimmed (or full) relaxed complex for SP scoring.
+    * ``sp_protein.pdb``  – trimmed (or full) relaxed protein for SP scoring.
+    * ``subsystem.pdb``   – updated ONIOM QM subsystem (if ``cfg.oniom``).
+
+    Parameters
+    ----------
+    lig_dir:
+        Per-ligand output directory.
+    cfg:
+        Pipeline configuration (trimming parameters are read from here).
+    """
+    ligand_resname = (lig_dir / "ligand_resname.txt").read_text().strip()
+    relaxed_complex_pdb = str(lig_dir / "relax_complex" / "xtbopt.pdb")
+
+    complex_atoms = parse_pdb(relaxed_complex_pdb)
+
+    if cfg.trim:
+        sp_atoms = trim_by_distance(
+            complex_atoms,
+            ligand_resname=ligand_resname,
+            cutoff=cfg.trim_cutoff,
+            cap_bonds=cfg.cap_bonds,
+            trim_level=cfg.trim_level,
+            exclude_solvent=cfg.exclude_solvent,
+            backbone_cuts_only=cfg.backbone_cuts_only,
+        )
+    else:
+        sp_atoms = complex_atoms
+
+    write_pdb(sp_atoms, str(lig_dir / "sp_complex.pdb"))
+
+    prot_atoms = [
+        a for a in sp_atoms
+        if a.resname.strip().upper() != ligand_resname.upper()
+    ]
+    write_pdb(prot_atoms, str(lig_dir / "sp_protein.pdb"))
+
+    lig_atoms = [
+        a for a in sp_atoms
+        if a.resname.strip().upper() == ligand_resname.upper()
+    ]
+    write_pdb(lig_atoms, str(lig_dir / "sp_ligand.pdb"))
+
+    if cfg.oniom:
+        # Full (untrimed) relaxed complex and protein for GFN-FF ONIOM SP
+        from shutil import copy2 as _copy2
+        _copy2(relaxed_complex_pdb, str(lig_dir / "full_complex.pdb"))
+        full_prot_atoms = [
+            a for a in complex_atoms
+            if a.resname.strip().upper() != ligand_resname.upper()
+        ]
+        write_pdb(full_prot_atoms, str(lig_dir / "full_protein.pdb"))
 
 
 # ---------------------------------------------------------------------------
@@ -305,34 +381,35 @@ def collect(cfg: DocktailConfig) -> pd.DataFrame:
             row["delta_e_kcal"] = None
 
         # ---- ONIOM composite energy ----
+        # deltaE_oniom = deltaE_gfnff(full) - deltaE_gfnff(trimmed) + deltaE_gfn2(trimmed)
         if cfg.oniom:
-            e_super_mm = _read_energy(lig_dir, "oniom_mm_super")
-            e_sub_mm = _read_energy(lig_dir, "oniom_mm_sub")
-            e_sub_qm = _read_energy(lig_dir, "oniom_qm_sub")
+            e_ff_full_cplx = _read_energy(lig_dir, "oniom_ff_full_complex")
+            e_ff_full_prot = _read_energy(lig_dir, "oniom_ff_full_protein")
+            e_ff_trim_cplx = _read_energy(lig_dir, "oniom_ff_trim_complex")
+            e_ff_trim_prot = _read_energy(lig_dir, "oniom_ff_trim_protein")
+            e_ff_lig       = _read_energy(lig_dir, "oniom_ff_ligand")
 
-            if all(e is not None for e in [e_super_mm, e_sub_mm, e_sub_qm]):
-                e_oniom_pl = oniom_energy(e_super_mm, e_sub_mm, e_sub_qm)
-                row["e_oniom_complex"] = e_oniom_pl
+            row["e_ff_full_complex_ha"] = e_ff_full_cplx
+            row["e_ff_full_protein_ha"] = e_ff_full_prot
+            row["e_ff_trim_complex_ha"] = e_ff_trim_cplx
+            row["e_ff_trim_protein_ha"] = e_ff_trim_prot
+            row["e_ff_ligand_ha"]       = e_ff_lig
 
-                # Protein ONIOM (using relaxed or standard protein dirs)
-                ep_super = _read_energy(lig_dir, "sp_protein")
-                ep_sub_mm = _read_energy(lig_dir, "oniom_mm_sub")
-                ep_sub_qm = _read_energy(lig_dir, "oniom_qm_sub")
-                if all(e is not None for e in [ep_super, ep_sub_mm, ep_sub_qm]):
-                    row["e_oniom_protein"] = oniom_energy(ep_super, ep_sub_mm, ep_sub_qm)
-
-                e_oniom_l = e_l  # ligand is entirely in QM region
-                row["e_oniom_ligand"] = e_oniom_l
-
-                if all(k in row and row[k] is not None
-                       for k in ("e_oniom_complex", "e_oniom_protein", "e_oniom_ligand")):
-                    delta_oniom = (
-                        row["e_oniom_complex"]
-                        - row["e_oniom_protein"]
-                        - row["e_oniom_ligand"]
-                    )
-                    row["delta_e_oniom_ha"] = delta_oniom
-                    row["delta_e_oniom_kcal"] = delta_oniom * HA_TO_KCAL
+            oniom_inputs = [
+                e_ff_full_cplx, e_ff_full_prot,
+                e_ff_trim_cplx, e_ff_trim_prot, e_ff_lig,
+            ]
+            if all(e is not None for e in oniom_inputs) and \
+               all(e is not None for e in [e_pl, e_p, e_l]):
+                delta_ff_full = binding_energy(e_ff_full_cplx, e_ff_full_prot, e_ff_lig)
+                delta_ff_trim = binding_energy(e_ff_trim_cplx, e_ff_trim_prot, e_ff_lig)
+                delta_gfn2    = binding_energy(e_pl, e_p, e_l)
+                delta_oniom   = delta_ff_full - delta_ff_trim + delta_gfn2
+                row["delta_e_oniom_ha"]   = delta_oniom
+                row["delta_e_oniom_kcal"] = delta_oniom * HA_TO_KCAL
+            else:
+                row["delta_e_oniom_ha"]   = None
+                row["delta_e_oniom_kcal"] = None
 
         results.append(row)
 
@@ -537,41 +614,42 @@ def _run_xtb_for_ligand(
     complex_charge = cfg.protein_charge + ligand_charge
     complex_uhf = cfg.protein_uhf + cfg.ligand_uhf
 
-    complex_pdb = str(lig_dir / "complex.pdb")
-    protein_pdb = str(lig_dir / "protein.pdb")
+    complex_full_pdb = str(lig_dir / "complex_full.pdb")
+    protein_full_pdb = str(lig_dir / "protein_full.pdb")
     ligand_pdb = str(lig_dir / "ligand.pdb")
 
     # Solvation is applied to scoring (GFN-n) steps but not force-field relaxation
     score_solvent = cfg.solvent if cfg.use_solvent_model else None
 
     if cfg.relax:
-        _, complex_pdb = relax_structure(
-            complex_pdb, str(lig_dir / "relax_complex"),
+        relax_complex_dir = str(lig_dir / "relax_complex")
+
+        # Relax the full complex (no trimming) so GFN-FF sees a complete
+        # molecular graph without disconnected fragments at cap sites.
+        relax_structure(
+            complex_full_pdb, relax_complex_dir,
             method=cfg.relax_method,
             charge=complex_charge,
             uhf=complex_uhf,
             xtb_exe=cfg.xtb_exe,
             xtb_mode=cfg.xtb_mode,
         )
-        _, protein_pdb = relax_structure(
-            protein_pdb, str(lig_dir / "relax_protein"),
-            method=cfg.relax_method,
-            charge=cfg.protein_charge,
-            uhf=cfg.protein_uhf,
-            xtb_exe=cfg.xtb_exe,
-            xtb_mode=cfg.xtb_mode,
-        )
-        _, ligand_pdb = relax_structure(
-            ligand_pdb, str(lig_dir / "relax_ligand"),
-            method=cfg.relax_method,
-            charge=ligand_charge,
-            uhf=cfg.ligand_uhf,
-            xtb_exe=cfg.xtb_exe,
-            xtb_mode=cfg.xtb_mode,
-        )
+
+        # Separate protein/ligand from the relaxed complex and trim for SP scoring
+        trim_relaxed_structures(lig_dir, cfg)
+
+        complex_pdb_sp = str(lig_dir / "sp_complex.pdb")
+        protein_pdb_sp = str(lig_dir / "sp_protein.pdb")
+        ligand_pdb_sp  = str(lig_dir / "sp_ligand.pdb")
+    else:
+        # No relaxation: SP runs on the pre-trimmed (or full) structures
+        # written during prepare().
+        complex_pdb_sp = str(lig_dir / "complex.pdb")
+        protein_pdb_sp = str(lig_dir / "protein.pdb")
+        ligand_pdb_sp  = str(lig_dir / "ligand.pdb")
 
     single_point_energy(
-        complex_pdb, str(lig_dir / "sp_complex"),
+        complex_pdb_sp, str(lig_dir / "sp_complex"),
         method=cfg.method,
         charge=complex_charge,
         uhf=complex_uhf,
@@ -581,7 +659,7 @@ def _run_xtb_for_ligand(
         solvent_model=cfg.solvent_model,
     )
     single_point_energy(
-        protein_pdb, str(lig_dir / "sp_protein"),
+        protein_pdb_sp, str(lig_dir / "sp_protein"),
         method=cfg.method,
         charge=cfg.protein_charge,
         uhf=cfg.protein_uhf,
@@ -591,7 +669,7 @@ def _run_xtb_for_ligand(
         solvent_model=cfg.solvent_model,
     )
     single_point_energy(
-        ligand_pdb, str(lig_dir / "sp_ligand"),
+        ligand_pdb_sp, str(lig_dir / "sp_ligand"),
         method=cfg.method,
         charge=ligand_charge,
         uhf=cfg.ligand_uhf,
@@ -602,21 +680,22 @@ def _run_xtb_for_ligand(
     )
 
     if cfg.oniom:
-        sub_pdb = str(lig_dir / "subsystem.pdb")
-        super_pdb = str(lig_dir / "complex.pdb")
+        # deltaE_oniom = deltaE_gfnff(full) - deltaE_gfnff(trimmed) + deltaE_gfn2(trimmed)
+        if cfg.relax:
+            full_complex_oniom = str(lig_dir / "full_complex.pdb")
+            full_protein_oniom = str(lig_dir / "full_protein.pdb")
+            trim_complex_oniom = str(lig_dir / "sp_complex.pdb")
+            trim_protein_oniom = str(lig_dir / "sp_protein.pdb")
+            lig_oniom          = str(lig_dir / "sp_ligand.pdb")
+        else:
+            full_complex_oniom = complex_full_pdb
+            full_protein_oniom = protein_full_pdb
+            trim_complex_oniom = str(lig_dir / "complex.pdb")
+            trim_protein_oniom = str(lig_dir / "protein.pdb")
+            lig_oniom          = ligand_pdb
 
         single_point_energy(
-            sub_pdb, str(lig_dir / "oniom_qm_sub"),
-            method=cfg.oniom_qm_method,
-            charge=ligand_charge,
-            uhf=cfg.ligand_uhf,
-            xtb_exe=cfg.xtb_exe,
-            xtb_mode=cfg.xtb_mode,
-            solvent=score_solvent,
-            solvent_model=cfg.solvent_model,
-        )
-        single_point_energy(
-            super_pdb, str(lig_dir / "oniom_mm_super"),
+            full_complex_oniom, str(lig_dir / "oniom_ff_full_complex"),
             method=cfg.oniom_mm_method,
             charge=complex_charge,
             uhf=complex_uhf,
@@ -624,10 +703,34 @@ def _run_xtb_for_ligand(
             xtb_mode=cfg.xtb_mode,
         )
         single_point_energy(
-            sub_pdb, str(lig_dir / "oniom_mm_sub"),
+            full_protein_oniom, str(lig_dir / "oniom_ff_full_protein"),
+            method=cfg.oniom_mm_method,
+            charge=cfg.protein_charge,
+            uhf=cfg.protein_uhf,
+            xtb_exe=cfg.xtb_exe,
+            xtb_mode=cfg.xtb_mode,
+        )
+        single_point_energy(
+            lig_oniom, str(lig_dir / "oniom_ff_ligand"),
             method=cfg.oniom_mm_method,
             charge=ligand_charge,
             uhf=cfg.ligand_uhf,
+            xtb_exe=cfg.xtb_exe,
+            xtb_mode=cfg.xtb_mode,
+        )
+        single_point_energy(
+            trim_complex_oniom, str(lig_dir / "oniom_ff_trim_complex"),
+            method=cfg.oniom_mm_method,
+            charge=complex_charge,
+            uhf=complex_uhf,
+            xtb_exe=cfg.xtb_exe,
+            xtb_mode=cfg.xtb_mode,
+        )
+        single_point_energy(
+            trim_protein_oniom, str(lig_dir / "oniom_ff_trim_protein"),
+            method=cfg.oniom_mm_method,
+            charge=cfg.protein_charge,
+            uhf=cfg.protein_uhf,
             xtb_exe=cfg.xtb_exe,
             xtb_mode=cfg.xtb_mode,
         )

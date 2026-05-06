@@ -63,8 +63,29 @@ class TestAtom:
         assert a.element_symbol() == "N"
 
     def test_element_symbol_inferred(self):
+        # "CA" is alpha-carbon in proteins → element should be C, not CA
         a = _make_atom(name="CA", element="")
-        assert a.element_symbol() == "CA"
+        assert a.element_symbol() == "C"
+
+    def test_element_symbol_inferred_two_letter(self):
+        # "MG" is magnesium → element should be MG (two-letter)
+        a = _make_atom(name="MG", element="")
+        assert a.element_symbol() == "MG"
+
+    def test_element_symbol_inferred_sg(self):
+        # "SG" (CYS side-chain sulfur) → element should be S, not SG
+        a = _make_atom(name="SG", element="")
+        assert a.element_symbol() == "S"
+
+    def test_element_symbol_inferred_og(self):
+        # "OG1" (THR/SER side-chain oxygen) → element should be O
+        a = _make_atom(name="OG1", element="")
+        assert a.element_symbol() == "O"
+
+    def test_element_symbol_inferred_hn(self):
+        # "HN" (backbone amide hydrogen) → element should be H
+        a = _make_atom(name="HN", element="")
+        assert a.element_symbol() == "H"
 
     def test_to_pdb_line_length(self):
         a = _make_atom()

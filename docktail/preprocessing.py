@@ -27,12 +27,23 @@ import numpy as np
 # Standard covalent bond radii (Å) – used for bond detection
 _COV_RADII: Dict[str, float] = {
     "H": 0.31, "C": 0.76, "N": 0.71, "O": 0.66,
-    "S": 1.05, "P": 1.07, "F": 0.64, "Cl": 0.99,
-    "Br": 1.14, "I": 1.33, "SE": 1.20,
+    "S": 1.05, "P": 1.07, "F": 0.64, "CL": 0.99,
+    "BR": 1.14, "I": 1.33, "SE": 1.20,
 }
 _DEFAULT_RADIUS = 0.77
 _BOND_TOLERANCE = 0.40  # extra Å added to sum of cov radii
 _CH_BOND_LENGTH = 1.09  # Å – used for H cap placement
+
+# Two-letter element symbols commonly found in biological systems.
+# Any atom name whose first two characters match one of these is treated as
+# that element; all other atoms use only the first letter of their name.
+# "CA" is intentionally omitted – in protein PDBs it is always alpha-carbon
+# (element C), never calcium (which appears as a HETATM with resname "CA"
+# and should have an explicit element column).
+_TWO_LETTER_ELEMENTS: frozenset[str] = frozenset({
+    "CL", "BR", "MG", "ZN", "FE", "CU", "MN", "CO", "NI",
+    "HG", "CD", "SE", "AU", "PT", "LI", "AL", "SI", "AS", "NA",
+})
 
 # Residue names treated as bulk solvent (water models)
 _SOLVENT_RESNAMES: Set[str] = {"HOH", "WAT", "TIP", "TIP3", "TIP4", "SOL", "H2O"}
@@ -81,12 +92,22 @@ class Atom:
         self.x, self.y, self.z = float(xyz[0]), float(xyz[1]), float(xyz[2])
 
     def element_symbol(self) -> str:
-        """Infer element from PDB element column or atom name."""
+        """Infer element from PDB element column or atom name.
+
+        Falls back to deriving from the atom name when no element column is
+        present.  Two-letter element symbols (e.g. MG, ZN, FE) are returned
+        for atoms whose names start with a known two-letter element.  All
+        other atoms return only the first letter of their name (e.g. SG → S,
+        OG → O, CA → C, HN → H).
+        """
         if self.element:
             return self.element.strip().upper()
-        # Strip leading digits and whitespace from atom name
-        sym = re.sub(r"^\d*", "", self.name.strip())[:2].strip()
-        return sym.upper() if sym else "C"
+        raw = re.sub(r"^\d*", "", self.name.strip()).upper()
+        two = raw[:2]
+        if two in _TWO_LETTER_ELEMENTS:
+            return two
+        one = raw[:1]
+        return one if one else "C"
 
     def to_pdb_line(self) -> str:
         name_field = self._format_name(self.name, self.element_symbol())
@@ -239,6 +260,32 @@ def infer_ligand_charge(pdb_file: str) -> Optional[int]:
         return Chem.GetFormalCharge(mol)
     except Exception:  # noqa: BLE001
         return None
+
+
+# ---------------------------------------------------------------------------
+# Solvent stripping
+# ---------------------------------------------------------------------------
+
+def strip_solvent(atoms: List[Atom]) -> List[Atom]:
+    """Return a copy of *atoms* with water and solvent residues removed.
+
+    Only solvent molecules (HOH, WAT, TIP variants, etc.) are removed.
+    Ions and cofactors are retained so that metal-binding sites are not
+    disrupted when preparing the full complex for GFN-FF relaxation.
+
+    Parameters
+    ----------
+    atoms:
+        Input list of :class:`Atom` objects.
+
+    Returns
+    -------
+    New list with solvent atoms excluded.
+    """
+    return [
+        a for a in atoms
+        if a.resname.strip().upper() not in _SOLVENT_RESNAMES
+    ]
 
 
 # ---------------------------------------------------------------------------
