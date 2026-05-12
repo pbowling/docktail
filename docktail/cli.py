@@ -117,10 +117,28 @@ def main():
               help="xTB backend: 'cli' (binary) or 'api' (xtb-python).")
 @click.option("--xtb-exe", default=None,
               help="Path to the xtb executable (CLI mode only).")
+@click.option("--pose-score-file", default=None,
+              help="Relative path within each ligand subdir to a score file "
+                   "(TSV/CSV) used to select the best pose.  Example: "
+                   "'results/facts_rescore.tsv'.  When set, docktail iterates "
+                   "over subdirectories of input-dir rather than using "
+                   "ligand-pattern.")
+@click.option("--pose-score-column", default=None,
+              help="Column name in the score file to rank poses by, "
+                   "e.g. 'FACTS'.  Required when --pose-score-file is given.")
+@click.option("--pose-score-ascending/--pose-score-descending", default=None,
+              help="Select the pose with the lowest (ascending) or highest "
+                   "(descending) score value. Default: ascending (lower = better).")
+@click.option("--pose-file-template", default=None,
+              help="Path template relative to each ligand subdir for the pose "
+                   "PDB, with '{pose}' as the pose-number placeholder.  "
+                   "Default: 'results/cluster/top_{pose}.pdb'.")
 def prepare_cmd(config, input_dir, output_dir, protein_pattern, ligand_pattern,
                 rankings, method, relax, trim, trim_cutoff, trim_level, cap,
                 exclude_solvent, backbone_cuts, oniom, oniom_qm_cutoff,
-                solvent, solvent_model, use_solvent_model, xtb_mode, xtb_exe):
+                solvent, solvent_model, use_solvent_model, xtb_mode, xtb_exe,
+                pose_score_file, pose_score_column, pose_score_ascending,
+                pose_file_template):
     """Prepare input files and generate SLURM scripts."""
     cfg = load_config(config)
     _apply_overrides(cfg, {
@@ -144,6 +162,10 @@ def prepare_cmd(config, input_dir, output_dir, protein_pattern, ligand_pattern,
         "use_solvent_model": use_solvent_model,
         "xtb_mode": xtb_mode,
         "xtb_exe": xtb_exe,
+        "pose_score_file": pose_score_file,
+        "pose_score_column": pose_score_column,
+        "pose_score_ascending": pose_score_ascending,
+        "pose_file_template": pose_file_template,
     })
 
     try:

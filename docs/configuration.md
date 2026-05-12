@@ -10,8 +10,36 @@ or overridden on the command line.
 | `input_dir` | str | `.` | Directory containing CDOCKER PDB output files |
 | `output_dir` | str | `docktail_output` | Root directory for all output |
 | `protein_pattern` | str | `protein*.pdb` | Glob pattern for protein PDB files |
-| `ligand_pattern` | str | `ligand*.pdb` | Glob pattern for ligand PDB files |
+| `ligand_pattern` | str | `ligand*.pdb` | Glob pattern for ligand PDB files (not used when `pose_score_file` is set) |
 | `rankings_file` | str | `""` | Path to CDOCKER rankings CSV (optional) |
+
+## Pose selection from score files
+
+When `pose_score_file` is set, docktail switches to a **subdirectory-based**
+discovery mode: it iterates over the immediate subdirectories of `input_dir`,
+reads the score file from each, selects the best-scoring pose, and locates
+the pose PDB via `pose_file_template`.  `ligand_pattern` is ignored in this
+mode.  The shared protein PDB is still found at the top level of `input_dir`
+via `protein_pattern`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `pose_score_file` | str | `""` | Relative path within each ligand subdirectory to a TSV/CSV score file, e.g. `results/facts_rescore.tsv`. Must contain a `pose` column and the column named in `pose_score_column`. |
+| `pose_score_column` | str | `""` | Column name to rank poses by, e.g. `FACTS`. Required when `pose_score_file` is set. |
+| `pose_score_ascending` | bool | `true` | When `true`, the pose with the **lowest** score is selected (default for energy/score quantities). Set to `false` to pick the highest. |
+| `pose_file_template` | str | `results/cluster/top_{pose}.pdb` | Path template relative to each ligand subdirectory, with `{pose}` replaced by the integer pose number. |
+
+**Example YAML:**
+
+```yaml
+input_dir: /data/cdocker
+output_dir: /data/docktail_results
+protein_pattern: protein.pdb
+pose_score_file: results/facts_rescore.tsv
+pose_score_column: FACTS
+pose_score_ascending: true
+pose_file_template: "results/cluster/top_{pose}.pdb"
+```
 
 ## Relaxation
 

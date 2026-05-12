@@ -107,6 +107,144 @@ def _discover_pairs(
     return pairs
 
 
+def _discover_pairs_from_scores(
+    input_dir: str,
+    protein_pattern: str,
+    pose_score_file: str,
+    pose_score_column: str,
+    pose_score_ascending: bool,
+    pose_file_template: str,
+) -> List[Tuple[str, str, str]]:
+    """Discover ligand poses by selecting the best-scored pose from per-ligand score files.
+
+    For each immediate subdirectory of *input_dir* that contains *pose_score_file*,
+    the TSV/CSV is read, rows sorted by *pose_score_column*, and the best pose
+    (lowest value when *pose_score_ascending* is True) is selected.  The
+    corresponding PDB path is built from *pose_file_template* (relative to the
+    ligand subdirectory) with ``{pose}`` replaced by the integer pose number.
+
+    The shared protein PDB is discovered from the top level of *input_dir* using
+    *protein_pattern*.  If multiple files match, the first sorted match is used
+    (one protein shared by all ligands).
+
+    Parameters
+    ----------
+    input_dir:
+        Root cdocker directory containing both the shared ``protein.pdb`` and
+        the numbered ligand subdirectories.
+    protein_pattern:
+        Glob pattern for the protein PDB at the top level of *input_dir*.
+    pose_score_file:
+        Path relative to each ligand subdirectory pointing to the score file,
+        e.g. ``"results/facts_rescore.tsv"``.
+    pose_score_column:
+        Column name in the score file used to rank poses, e.g. ``"FACTS"``.
+    pose_score_ascending:
+        When True the pose with the *lowest* value is selected (default for
+        energy/score-like quantities).
+    pose_file_template:
+        Path template relative to each ligand subdirectory with a ``{pose}``
+        placeholder, e.g. ``"results/cluster/top_{pose}.pdb"``.
+
+    Returns
+    -------
+    Sorted list of ``(ligand_name, protein_pdb, ligand_pdb)`` tuples.
+    """
+    p = Path(input_dir)
+
+    # Find the shared protein PDB
+    protein_files = sorted(
+        str(f) for f in p.iterdir()
+        if fnmatch.fnmatch(f.name, protein_pattern)
+    )
+    if not protein_files:
+        raise FileNotFoundError(
+            f"No protein PDB files matching '{protein_pattern}' found in {input_dir}"
+        )
+    protein_pdb = protein_files[0]
+    if len(protein_files) > 1:
+        warnings.warn(
+            f"Multiple protein files found in {input_dir}; using '{protein_pdb}'.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    pairs: List[Tuple[str, str, str]] = []
+    missing_score: List[str] = []
+    missing_pose: List[str] = []
+
+    for subdir in sorted(p.iterdir()):
+        if not subdir.is_dir():
+            continue
+        score_path = subdir / pose_score_file
+        if not score_path.exists():
+            missing_score.append(subdir.name)
+            continue
+
+        try:
+            df = pd.read_csv(score_path, sep=None, engine="python")
+        except Exception as exc:
+            warnings.warn(
+                f"Could not read score file '{score_path}': {exc}. Skipping.",
+                UserWarning,
+                stacklevel=3,
+            )
+            continue
+
+        if pose_score_column not in df.columns:
+            raise ValueError(
+                f"Column '{pose_score_column}' not found in '{score_path}'. "
+                f"Available columns: {list(df.columns)}"
+            )
+        if "pose" not in df.columns:
+            raise ValueError(
+                f"Column 'pose' not found in '{score_path}'. "
+                f"Available columns: {list(df.columns)}"
+            )
+
+        best_row = df.sort_values(pose_score_column, ascending=pose_score_ascending).iloc[0]
+        best_pose = int(best_row["pose"])
+        best_score = best_row[pose_score_column]
+
+        pose_rel = pose_file_template.format(pose=best_pose)
+        pose_pdb = str(subdir / pose_rel)
+        if not Path(pose_pdb).exists():
+            missing_pose.append(f"{subdir.name} (pose {best_pose}: {pose_pdb})")
+            continue
+
+        name = subdir.name
+        pairs.append((name, protein_pdb, pose_pdb))
+        # Attach score metadata as an attribute so prepare() can log it
+        pairs[-1] = (name, protein_pdb, pose_pdb)
+
+    if missing_score:
+        warnings.warn(
+            f"{len(missing_score)} subdirectory(ies) had no score file "
+            f"'{pose_score_file}' and were skipped: "
+            + ", ".join(missing_score[:10])
+            + ("..." if len(missing_score) > 10 else ""),
+            UserWarning,
+            stacklevel=3,
+        )
+    if missing_pose:
+        warnings.warn(
+            f"{len(missing_pose)} ligand(s) had a best-pose PDB that could not "
+            "be found and were skipped: "
+            + ", ".join(missing_pose[:10])
+            + ("..." if len(missing_pose) > 10 else ""),
+            UserWarning,
+            stacklevel=3,
+        )
+
+    if not pairs:
+        raise FileNotFoundError(
+            f"No valid ligand poses found under '{input_dir}' using "
+            f"score file '{pose_score_file}'."
+        )
+
+    return pairs
+
+
 def _infer_ligand_resname(ligand_pdb: str) -> str:
     """Return the residue name of the first HETATM / non-solvent atom in *ligand_pdb*."""
     atoms = parse_pdb(ligand_pdb)
@@ -138,7 +276,21 @@ def prepare(cfg: DocktailConfig) -> List[str]:
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pairs = _discover_pairs(cfg.input_dir, cfg.protein_pattern, cfg.ligand_pattern)
+    if cfg.pose_score_file:
+        if not cfg.pose_score_column:
+            raise ValueError(
+                "'pose_score_column' must be set when 'pose_score_file' is provided."
+            )
+        pairs = _discover_pairs_from_scores(
+            cfg.input_dir,
+            cfg.protein_pattern,
+            cfg.pose_score_file,
+            cfg.pose_score_column,
+            cfg.pose_score_ascending,
+            cfg.pose_file_template,
+        )
+    else:
+        pairs = _discover_pairs(cfg.input_dir, cfg.protein_pattern, cfg.ligand_pattern)
 
     # ------------------------------------------------------------------
     # Protein charge: PSF overrides explicit protein_charge when provided
