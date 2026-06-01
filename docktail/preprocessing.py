@@ -32,7 +32,9 @@ _COV_RADII: Dict[str, float] = {
 }
 _DEFAULT_RADIUS = 0.77
 _BOND_TOLERANCE = 0.40  # extra Å added to sum of cov radii
-_CH_BOND_LENGTH = 1.09  # Å – used for H cap placement
+_CH_BOND_LENGTH = 1.09  # Å – C–H bond length for backbone H caps
+_NH_BOND_LENGTH = 1.01  # Å – N–H bond length for N-terminal terminus atoms
+_CO_BOND_LENGTH = 1.25  # Å – C–O bond length for C-terminal OXT
 
 # Two-letter element symbols commonly found in biological systems.
 # Any atom name whose first two characters match one of these is treated as
@@ -173,7 +175,7 @@ def parse_pdb(pdb_file: str) -> List[Atom]:
                 altloc = line[16:17]
                 resname = line[17:20].strip()
                 chain = line[21:22]
-                resseq = int(line[22:26])
+                resseq = int(line[22:26]) if line[22:26].strip() else 0
                 icode = line[26:27]
                 x = float(line[30:38])
                 y = float(line[38:46])
@@ -352,6 +354,95 @@ def _build_bond_list(atoms: List[Atom]) -> Dict[int, List[int]]:
     return bonds
 
 
+def _fill_sp3_positions(
+    center: np.ndarray,
+    existing_vecs: List[np.ndarray],
+    n_to_add: int,
+    bond_length: float,
+) -> List[np.ndarray]:
+    """Return *n_to_add* positions that complete sp3 tetrahedral geometry.
+
+    *existing_vecs* are **unit** vectors from *center* toward atoms already
+    bonded.  The returned positions respect 109.5° tetrahedral angles with
+    all existing bonds and with each other.
+    """
+    n = len(existing_vecs)
+    out: List[np.ndarray] = []
+    if n_to_add <= 0 or n > 3:
+        return out
+
+    if n == 0:
+        # Degenerate: place at vertices of a reference tetrahedron.
+        for v in [
+            np.array([ 1.,  1.,  1.]),
+            np.array([-1., -1.,  1.]),
+            np.array([-1.,  1., -1.]),
+            np.array([ 1., -1., -1.]),
+        ]:
+            if len(out) == n_to_add:
+                break
+            out.append(center + bond_length * v / np.linalg.norm(v))
+        return out
+
+    if n == 3:
+        # 4th sp3 position is opposite the sum of the other three.
+        s = existing_vecs[0] + existing_vecs[1] + existing_vecs[2]
+        out.append(center + bond_length * (-s / np.linalg.norm(s)))
+        return out
+
+    if n == 2:
+        # Solve for the two remaining tetrahedral positions given 2 existing bonds.
+        # Derived from h·va = h·vb = cos(109.5°) = -1/3 and |h| = 1.
+        va, vb = existing_vecs[0], existing_vecs[1]
+        p = float(np.dot(va, vb))
+        cross = np.cross(va, vb)
+        clen = float(np.linalg.norm(cross))
+        if clen < 1e-6:  # collinear bonds – use arbitrary perpendicular
+            seed = np.array([1., 0., 0.]) if abs(float(va[0])) < 0.9 else np.array([0., 1., 0.])
+            cross = np.cross(va, seed)
+            clen = float(np.linalg.norm(cross))
+        cross /= clen
+        denom = max(1.0 + p, 1e-8)
+        a = -1.0 / (3.0 * denom)
+        c = float(np.sqrt(max(0.0, 1.0 - 2.0 * a * a * (1.0 + p))))
+        hab = a * (va + vb)
+        for sign in [+1.0, -1.0]:
+            if len(out) == n_to_add:
+                break
+            h = hab + sign * c * cross
+            out.append(center + bond_length * h / np.linalg.norm(h))
+        return out
+
+    # n == 1: remaining positions lie on a cone around –va at the tetrahedral angle.
+    va = existing_vecs[0]
+    seed = np.array([1., 0., 0.]) if abs(float(va[0])) < 0.9 else np.array([0., 1., 0.])
+    p1 = np.cross(va, seed);  p1 /= np.linalg.norm(p1)
+    p2 = np.cross(va, p1);    p2 /= np.linalg.norm(p2)
+    theta = float(np.radians(70.5))  # cone half-angle = 180° – 109.5°
+    for k in range(n_to_add):
+        phi = k * 2.0 * float(np.pi) / n_to_add
+        d = (np.cos(theta) * (-va)
+             + np.sin(theta) * (np.cos(phi) * p1 + np.sin(phi) * p2))
+        out.append(center + bond_length * d / np.linalg.norm(d))
+    return out
+
+
+def _place_oxt_position(
+    c_pos: np.ndarray,
+    ca_pos: np.ndarray,
+    o_pos: np.ndarray,
+) -> np.ndarray:
+    """Return the position of OXT for a C-terminal carboxylate.
+
+    OXT is placed in the CA–C–O plane using sp2 geometry: the sum of the
+    C→O and C→OXT unit vectors points away from C→CA (ideal 120° angles).
+    """
+    vca = ca_pos - c_pos;  vca /= np.linalg.norm(vca)
+    vo  = o_pos  - c_pos;  vo  /= np.linalg.norm(vo)
+    voxt = -(vca + vo)
+    return c_pos + _CO_BOND_LENGTH * voxt / np.linalg.norm(voxt)
+
+
 # ---------------------------------------------------------------------------
 # Trimming
 # ---------------------------------------------------------------------------
@@ -456,19 +547,168 @@ def trim_by_distance(
 
     kept_atoms: List[Atom] = [atoms[i] for i in sorted(kept_idx)]
 
-    if not cap_bonds or not removed_idx:
+    # Quick exit when neither capping nor terminus completion is needed.
+    if not cap_bonds and not backbone_cuts_only:
         if return_constrained:
             return kept_atoms, []
         return kept_atoms
 
     # ---- 2. Build bond list on full atom set ----
+    # Required for cap placement (cap_bonds) AND terminal atom completion
+    # (backbone_cuts_only), so build it before either early-exit check.
     bonds = _build_bond_list(atoms)
+
+    # ---- 2a. Backbone link-atom extension for N-terminal peptide cuts ----
+    # With trim_level="residue" the boundary between kept and excluded residues
+    # always falls at an inter-residue C(i)–N(i+1) peptide bond, never at a
+    # C–Cα bond.  When backbone_cuts_only is requested we use the QM/MM
+    # link-atom scheme: pull the excluded backbone C (and its bonded O) into
+    # the kept set so the N-terminus of the trimmed chain has a proper peptide
+    # carbonyl group.  The cap loop below then sees a kept-C bonded to an
+    # excluded-Cα, which IS a backbone C–Cα bond, and places the H cap there.
+    backbone_pulled_in: Set[int] = set()
+    if backbone_cuts_only:
+        for ki in sorted(kept_idx):
+            if atoms[ki].name.strip() != "N":
+                continue
+            for ri in bonds[ki]:
+                if ri not in removed_idx:
+                    continue
+                if atoms[ri].name.strip() != "C":
+                    continue
+                # Backbone N-terminal peptide cut: pull in excluded C and O.
+                backbone_pulled_in.add(ri)
+                for ri2 in bonds[ri]:
+                    if ri2 in removed_idx and atoms[ri2].name.strip() == "O":
+                        backbone_pulled_in.add(ri2)
+        if backbone_pulled_in:
+            kept_idx |= backbone_pulled_in
+            removed_idx -= backbone_pulled_in
+            kept_atoms = [atoms[i] for i in sorted(kept_idx)]
+
+    # ---- 2b. Terminal atom completion for true chain termini in the QM region ----
+    # When the true N- or C-terminus of a protein chain is within the QM region,
+    # its terminal groups may be absent from the complex PDB (NH3+/NH2+ at the
+    # N-terminus; CO2- at the C-terminus).  Detect these and add the missing
+    # atoms so xTB sees correct valence.
+    #
+    # A true N-terminal N: no bonded backbone "C" atom anywhere in the PDB
+    # (after step 2a, any excluded preceding-residue C would have been pulled in).
+    # A true C-terminal C: no bonded backbone "N" atom anywhere in the PDB
+    # and not a link-atom-pulled-in carbonyl C.
+    #
+    # These atoms are placed in a separate list (term_atoms) so they are NOT
+    # added to the constrained set — they are real structural atoms, not caps.
+    term_atoms: List[Atom] = []
+    term_serial = max(a.serial for a in atoms) + 1
+
+    if backbone_cuts_only:
+        for ki in sorted(kept_idx):
+            a_k = atoms[ki]
+
+            # ── N-terminal case ───────────────────────────────────────────
+            if a_k.name.strip() == "N":
+                # Any bond to a backbone "C" means a preceding residue exists.
+                if any(atoms[ri].name.strip() == "C" for ri in bonds[ki]):
+                    continue
+                existing_h_ri = [
+                    ri for ri in bonds[ki]
+                    if atoms[ri].element_symbol() == "H" and ri in kept_idx
+                ]
+                is_pro = (a_k.resname.strip() == "PRO")
+                # PRO N-terminus: NH2+ (2 H total); standard AA: NH3+ (3 H total).
+                expected_h = 2 if is_pro else 3
+                n_to_add = expected_h - len(existing_h_ri)
+                if n_to_add <= 0:
+                    continue
+                existing_vecs = []
+                for ri in bonds[ki]:
+                    if ri not in kept_idx:
+                        continue
+                    dv = atoms[ri].coords - a_k.coords
+                    dn = float(np.linalg.norm(dv))
+                    if dn > 1e-6:
+                        existing_vecs.append(dv / dn)
+                for pos in _fill_sp3_positions(
+                    a_k.coords, existing_vecs, n_to_add, _NH_BOND_LENGTH
+                ):
+                    term_atoms.append(Atom(
+                        record_type="ATOM",
+                        serial=term_serial,
+                        name="HT",
+                        altloc="",
+                        resname=a_k.resname,
+                        chain=a_k.chain,
+                        resseq=a_k.resseq,
+                        icode=a_k.icode,
+                        x=float(pos[0]),
+                        y=float(pos[1]),
+                        z=float(pos[2]),
+                        occupancy=1.0,
+                        bfactor=0.0,
+                        element="H",
+                        charge="",
+                    ))
+                    term_serial += 1
+
+            # ── C-terminal case ───────────────────────────────────────────
+            elif a_k.name.strip() == "C" and ki not in backbone_pulled_in:
+                # Any bond to a backbone "N" means a following residue exists.
+                if any(atoms[ri].name.strip() == "N" for ri in bonds[ki]):
+                    continue
+                # OXT already present in the QM region → nothing to do.
+                if any(
+                    atoms[ri].name.strip() == "OXT"
+                    for ri in bonds[ki]
+                    if ri in kept_idx
+                ):
+                    continue
+                ca_ri = next(
+                    (ri for ri in bonds[ki]
+                     if atoms[ri].name.strip() == "CA" and ri in kept_idx),
+                    None,
+                )
+                o_ri = next(
+                    (ri for ri in bonds[ki]
+                     if atoms[ri].name.strip() == "O" and ri in kept_idx),
+                    None,
+                )
+                if ca_ri is None or o_ri is None:
+                    continue
+                pos = _place_oxt_position(
+                    a_k.coords, atoms[ca_ri].coords, atoms[o_ri].coords
+                )
+                term_atoms.append(Atom(
+                    record_type="ATOM",
+                    serial=term_serial,
+                    name="OXT",
+                    altloc="",
+                    resname=a_k.resname,
+                    chain=a_k.chain,
+                    resseq=a_k.resseq,
+                    icode=a_k.icode,
+                    x=float(pos[0]),
+                    y=float(pos[1]),
+                    z=float(pos[2]),
+                    occupancy=1.0,
+                    bfactor=0.0,
+                    element="O",
+                    charge="",
+                ))
+                term_serial += 1
+
+    # If no bonds were severed, return now with any terminal atoms but no HC caps.
+    if not cap_bonds or not removed_idx:
+        result_atoms = kept_atoms + term_atoms
+        if return_constrained:
+            return result_atoms, []
+        return result_atoms
 
     # ---- 3. For each kept atom bonded to a removed atom, add H cap ----
     # Map original index → 0-based position in kept_atoms (for serial calculation)
     orig_to_kept_pos = {ki: pos for pos, ki in enumerate(sorted(kept_idx))}
     cap_atoms: List[Atom] = []
-    cap_serial = max(a.serial for a in atoms) + 1
+    cap_serial = term_serial  # continue from terminal-atom counter
     boundary_kept_serials: List[int] = []  # 1-based serials of cut-site kept atoms
 
     for ki in sorted(kept_idx):
@@ -485,9 +725,10 @@ def trim_by_distance(
                 boundary_kept_serials.append(kept_serial_in_output)
 
             # When backbone_cuts_only is requested, only place a cap when the
-            # severed bond is the intra-residue backbone C–Cα bond.  The cap
-            # is placed on the Cα atom (kept) in the direction of the backbone
-            # C (removed), or on the backbone C (kept) toward Cα (removed).
+            # severed bond is a backbone C–Cα bond, or at the C-terminal
+            # boundary of the trimmed chain (kept-C bonded to excluded-N).
+            # Pulled-in carbonyl C atoms (backbone_pulled_in) are never
+            # C-terminal caps — their C–Cα cap is handled by the C–Cα branch.
             if backbone_cuts_only:
                 k_name = kept_atom.name.strip()
                 r_name = removed_atom.name.strip()
@@ -495,7 +736,13 @@ def trim_by_distance(
                     (k_name == _BACKBONE_CA_NAME and r_name == _BACKBONE_C_NAME)
                     or (k_name == _BACKBONE_C_NAME and r_name == _BACKBONE_CA_NAME)
                 )
-                if not is_backbone_cca:
+                # C-terminal cut: kept-C bonded to excluded-N (not a pulled-in C)
+                is_cterminal_cn = (
+                    k_name == _BACKBONE_C_NAME
+                    and r_name == "N"
+                    and ki not in backbone_pulled_in
+                )
+                if not is_backbone_cca and not is_cterminal_cn:
                     continue
 
             direction = removed_atom.coords - kept_atom.coords
@@ -524,12 +771,21 @@ def trim_by_distance(
             cap_atoms.append(cap)
             cap_serial += 1
 
-    result_atoms = kept_atoms + cap_atoms
+    # term_atoms (HT / OXT) are NOT constrained — they are real structural atoms.
+    # cap_atoms (HC) ARE constrained — they are artificial link atoms.
+    result_atoms = kept_atoms + term_atoms + cap_atoms
 
     if return_constrained:
-        # Cap H serials follow all kept_atoms in the output PDB (1-based)
-        cap_serials = [len(kept_atoms) + j + 1 for j in range(len(cap_atoms))]
-        all_constrained = sorted(set(boundary_kept_serials + cap_serials))
+        n_real = len(kept_atoms) + len(term_atoms)
+        # HC cap serials follow all real atoms in the output PDB (1-based).
+        cap_serials = [n_real + j + 1 for j in range(len(cap_atoms))]
+        # Pulled-in backbone C/O atoms are boundary anchors: also constrained.
+        pulled_in_serials = [
+            orig_to_kept_pos[pi] + 1
+            for pi in backbone_pulled_in
+            if pi in orig_to_kept_pos
+        ]
+        all_constrained = sorted(set(boundary_kept_serials + cap_serials + pulled_in_serials))
         return result_atoms, all_constrained
     return result_atoms
 

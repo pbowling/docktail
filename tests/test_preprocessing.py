@@ -410,20 +410,22 @@ class TestBackboneCutsOnly:
                            record_type="HETATM")
         return [r1_ca, r1_c, r2_n, r2_ca, lig]
 
-    def test_backbone_cap_placed_at_C_CA_bond(self):
-        """With backbone_cuts_only, a cap H is added at the C–CA bond only."""
+    def test_backbone_cap_placed_at_CN_cterminal_bond(self):
+        """With backbone_cuts_only, a C-terminal C–N cut gets an HC cap.
+
+        The QM/MM link-atom scheme places an H at the backbone C in the
+        direction of the excluded N when the C-terminal boundary of the
+        trimmed chain is severed at an inter-residue C–N peptide bond.
+        """
         atoms = self._make_backbone_fragment()
-        # atom-level cutoff keeps r1_ca, r1_c, lig but not r2_n/r2_ca
-        # The C(r1) – N(r2) bond would normally be capped; with backbone_cuts_only
-        # only C–CA bonds are capped.
+        # atom-level cutoff keeps r1_ca, r1_c, lig but not r2_n/r2_ca.
+        # r1_c (name "C") bonded to r2_n (name "N") is a C-terminal backbone
+        # cut → exactly 1 HC cap must be produced.
         trimmed = trim_by_distance(atoms, "LIG", cutoff=3.5,
                                    cap_bonds=True, trim_level="atom",
                                    backbone_cuts_only=True)
         cap_atoms = [a for a in trimmed if a.element_symbol() == "H"]
-        # The C(r1_c) is bonded to N(r2_n) [NOT a C–CA bond] → no cap.
-        # r1_c (name "C") has no CA neighbour among removed atoms → no cap here.
-        # Therefore no backbone C–CA cap should be present.
-        assert len(cap_atoms) == 0
+        assert len(cap_atoms) == 1
 
     def test_backbone_cap_placed_correctly(self):
         """H cap is added at a genuine C–CA bond when backbone_cuts_only=True."""
@@ -457,6 +459,163 @@ class TestBackboneCutsOnly:
                                    backbone_cuts_only=True)
         cap_atoms = [a for a in trimmed if a.element_symbol() == "H"]
         assert len(cap_atoms) == 0
+
+
+class TestTerminalAtomCompletion:
+    """Tests for step 2b: adding missing terminal NH/OXT atoms."""
+
+    def _pro_nterm(self):
+        """Minimal N-terminal PRO: N bonded to CA and CD only (no HN).
+        LIG is placed at (0, 0, 3.5) — within cutoff but not within bonding
+        distance of N, so it does not contribute a false neighbour vector."""
+        n   = _make_atom(1, "N",  "PRO", 1, 0.00, 0.00, 0.00, "N", chain="A")
+        ca  = _make_atom(2, "CA", "PRO", 1, 1.46, 0.00, 0.00, "C", chain="A")
+        cd  = _make_atom(3, "CD", "PRO", 1, 0.40, 1.40, 0.00, "C", chain="A")
+        lig = _make_atom(4, "C1", "LIG", 9, 0.00, 0.00, 3.50, "C", chain="B",
+                         record_type="HETATM")
+        return [n, ca, cd, lig]
+
+    def _ala_nterm_no_hn(self):
+        """Minimal N-terminal ALA: N bonded to CA only, no HN in PDB.
+        LIG is placed at (0, 0, 3.5) to avoid false N–LIG bond."""
+        n   = _make_atom(1, "N",  "ALA", 1, 0.00, 0.00, 0.00, "N", chain="A")
+        ca  = _make_atom(2, "CA", "ALA", 1, 1.46, 0.00, 0.00, "C", chain="A")
+        lig = _make_atom(3, "C1", "LIG", 9, 0.00, 0.00, 3.50, "C", chain="B",
+                         record_type="HETATM")
+        return [n, ca, lig]
+
+    def _ala_nterm_with_hn(self):
+        """N-terminal ALA with HN present (should add 2 more H for NH3+).
+        LIG is placed at (0, 0, 3.5) to avoid false N–LIG bond."""
+        n   = _make_atom(1, "N",  "ALA", 1,  0.00, 0.00, 0.00, "N", chain="A")
+        ca  = _make_atom(2, "CA", "ALA", 1,  1.46, 0.00, 0.00, "C", chain="A")
+        hn  = _make_atom(3, "HN", "ALA", 1, -0.50, 0.90, 0.00, "H", chain="A")
+        lig = _make_atom(4, "C1", "LIG", 9,  0.00, 0.00, 3.50, "C", chain="B",
+                         record_type="HETATM")
+        return [n, ca, hn, lig]
+
+    def _ala_cterm(self):
+        """Minimal C-terminal ALA: C bonded to CA and O, OXT missing."""
+        ca  = _make_atom(1, "CA", "ALA", 1,  0.00, 0.00, 0.0, "C", chain="A")
+        c   = _make_atom(2, "C",  "ALA", 1,  1.52, 0.00, 0.0, "C", chain="A")
+        o   = _make_atom(3, "O",  "ALA", 1,  2.14, 1.16, 0.0, "O", chain="A")
+        lig = _make_atom(4, "C1", "LIG", 9,  0.10, 0.00, 0.0, "C", chain="B",
+                         record_type="HETATM")
+        return [ca, c, o, lig]
+
+    def _ala_cterm_with_oxt(self):
+        """C-terminal ALA with OXT already present."""
+        ca  = _make_atom(1, "CA",  "ALA", 1,  0.00, 0.00, 0.0, "C", chain="A")
+        c   = _make_atom(2, "C",   "ALA", 1,  1.52, 0.00, 0.0, "C", chain="A")
+        o   = _make_atom(3, "O",   "ALA", 1,  2.14, 1.16, 0.0, "O", chain="A")
+        oxt = _make_atom(4, "OXT", "ALA", 1,  2.14,-1.16, 0.0, "O", chain="A")
+        lig = _make_atom(5, "C1", "LIG",  9,  0.10, 0.00, 0.0, "C", chain="B",
+                         record_type="HETATM")
+        return [ca, c, o, oxt, lig]
+
+    def _mid_chain(self):
+        """ALA in the middle of a chain: N bonded to preceding C (resseq=0).
+        No terminal H or OXT should be added."""
+        prev_c = _make_atom(1, "C",  "GLY", 0,  0.00, 0.00, 0.0, "C", chain="A")
+        prev_o = _make_atom(2, "O",  "GLY", 0, -0.50, 1.10, 0.0, "O", chain="A")
+        n      = _make_atom(3, "N",  "ALA", 1,  1.33, 0.00, 0.0, "N", chain="A")
+        ca     = _make_atom(4, "CA", "ALA", 1,  2.79, 0.00, 0.0, "C", chain="A")
+        c      = _make_atom(5, "C",  "ALA", 1,  4.31, 0.00, 0.0, "C", chain="A")
+        o      = _make_atom(6, "O",  "ALA", 1,  4.93, 1.16, 0.0, "O", chain="A")
+        next_n = _make_atom(7, "N",  "GLY", 2,  5.64, 0.00, 0.0, "N", chain="A")
+        lig    = _make_atom(8, "C1", "LIG", 9,  2.90, 0.00, 0.0, "C", chain="B",
+                            record_type="HETATM")
+        return [prev_c, prev_o, n, ca, c, o, next_n, lig]
+
+    def test_pro_nterm_gets_two_ht(self):
+        """True N-terminal PRO with no HN gets 2 HT atoms (NH2+)."""
+        trimmed = trim_by_distance(
+            self._pro_nterm(), "LIG", cutoff=5.0,
+            cap_bonds=True, trim_level="residue", backbone_cuts_only=True,
+        )
+        ht_atoms = [a for a in trimmed if a.name.strip() == "HT"]
+        assert len(ht_atoms) == 2
+        # Verify positions are at ~1.01 Å from N
+        n_atom = next(a for a in trimmed if a.name.strip() == "N")
+        import numpy as np
+        n_pos = np.array([n_atom.x, n_atom.y, n_atom.z])
+        for h in ht_atoms:
+            h_pos = np.array([h.x, h.y, h.z])
+            assert abs(np.linalg.norm(h_pos - n_pos) - 1.01) < 0.05
+
+    def test_ala_nterm_no_hn_gets_three_ht(self):
+        """True N-terminal ALA with no H gets 3 HT atoms (NH3+)."""
+        trimmed = trim_by_distance(
+            self._ala_nterm_no_hn(), "LIG", cutoff=5.0,
+            cap_bonds=True, trim_level="residue", backbone_cuts_only=True,
+        )
+        ht_atoms = [a for a in trimmed if a.name.strip() == "HT"]
+        assert len(ht_atoms) == 3
+
+    def test_ala_nterm_with_hn_gets_two_ht(self):
+        """True N-terminal ALA with HN already present gets 2 HT atoms."""
+        trimmed = trim_by_distance(
+            self._ala_nterm_with_hn(), "LIG", cutoff=5.0,
+            cap_bonds=True, trim_level="residue", backbone_cuts_only=True,
+        )
+        ht_atoms = [a for a in trimmed if a.name.strip() == "HT"]
+        assert len(ht_atoms) == 2
+
+    def test_ala_cterm_missing_oxt_gets_oxt(self):
+        """True C-terminal ALA missing OXT gets one OXT atom added."""
+        trimmed = trim_by_distance(
+            self._ala_cterm(), "LIG", cutoff=5.0,
+            cap_bonds=True, trim_level="residue", backbone_cuts_only=True,
+        )
+        oxt_atoms = [a for a in trimmed if a.name.strip() == "OXT"]
+        assert len(oxt_atoms) == 1
+        # OXT should be at ~1.25 Å from C, in the CA-C-O plane
+        c_atom  = next(a for a in trimmed if a.name.strip() == "C")
+        ca_atom = next(a for a in trimmed if a.name.strip() == "CA")
+        o_atom  = next(a for a in trimmed if a.name.strip() == "O")
+        import numpy as np
+        c_pos  = np.array([c_atom.x,  c_atom.y,  c_atom.z])
+        oxt    = oxt_atoms[0]
+        oxt_pos = np.array([oxt.x, oxt.y, oxt.z])
+        assert abs(np.linalg.norm(oxt_pos - c_pos) - 1.25) < 0.05
+        # OXT should be at ~120° from O (sp2 carboxylate geometry)
+        ca_pos = np.array([ca_atom.x, ca_atom.y, ca_atom.z])
+        o_pos  = np.array([o_atom.x,  o_atom.y,  o_atom.z])
+        vo = (o_pos - c_pos) / np.linalg.norm(o_pos - c_pos)
+        voxt = (oxt_pos - c_pos) / np.linalg.norm(oxt_pos - c_pos)
+        cos_angle = float(np.dot(vo, voxt))
+        assert cos_angle < -0.4, f"O-C-OXT angle should be ~120°, cos={cos_angle:.3f}"
+
+    def test_ala_cterm_with_oxt_unchanged(self):
+        """C-terminal ALA with OXT already present should get no extra OXT."""
+        trimmed = trim_by_distance(
+            self._ala_cterm_with_oxt(), "LIG", cutoff=5.0,
+            cap_bonds=True, trim_level="residue", backbone_cuts_only=True,
+        )
+        oxt_atoms = [a for a in trimmed if a.name.strip() == "OXT"]
+        assert len(oxt_atoms) == 1  # only the original
+
+    def test_mid_chain_no_terminal_atoms_added(self):
+        """Middle-of-chain residue should produce no HT or OXT."""
+        # cutoff=6.0 keeps ALA (resseq=1) but excludes GLY(0) and GLY(2)
+        trimmed = trim_by_distance(
+            self._mid_chain(), "LIG", cutoff=6.0,
+            cap_bonds=True, trim_level="residue", backbone_cuts_only=True,
+        )
+        assert not any(a.name.strip() == "HT"  for a in trimmed)
+        assert not any(a.name.strip() == "OXT" for a in trimmed)
+
+    def test_terminal_atoms_not_constrained(self):
+        """HT and OXT atoms should NOT appear in the constrained serial list."""
+        trimmed, constrained = trim_by_distance(
+            self._pro_nterm(), "LIG", cutoff=5.0,
+            cap_bonds=True, trim_level="residue", backbone_cuts_only=True,
+            return_constrained=True,
+        )
+        ht_indices = [i + 1 for i, a in enumerate(trimmed) if a.name.strip() == "HT"]
+        assert ht_indices, "Expected HT atoms to be present"
+        for idx in ht_indices:
+            assert idx not in constrained, f"HT atom at serial {idx} should not be constrained"
 
 
 # ---------------------------------------------------------------------------
