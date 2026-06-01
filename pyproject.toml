@@ -24,6 +24,9 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]
+rdkit = [
+    "rdkit>=2022.09",
+]
 xtb-api = [
     "xtb>=22.1",
 ]

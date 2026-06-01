@@ -7,6 +7,8 @@ prepare   – Prepare input files and generate SLURM scripts
 submit    – Submit previously prepared SLURM scripts
 collect   – Parse xTB results and write CSV/report
 run       – Full pipeline without SLURM (direct execution)
+archive   – Pack calculation files into a tar.gz (excluding reports/CSV)
+recharge  – Re-infer ligand charges; fix scripts and clear stale results
 
 Example
 -------
@@ -43,7 +45,7 @@ from pathlib import Path
 import click
 
 from .config import DocktailConfig, load_config
-from .pipeline import collect, prepare, run_full_pipeline, trim_relaxed_structures
+from .pipeline import archive, collect, prepare, recharge, run_full_pipeline, trim_relaxed_structures
 from .slurm import submit_job
 
 
@@ -368,3 +370,124 @@ def trim_relaxed_cmd(lig_dir, config):
         click.echo(f"Error: {exc}", err=True)
         sys.exit(1)
     click.echo(f"Trimmed relaxed structures written to '{lig_dir}'.")
+
+
+# ---------------------------------------------------------------------------
+# archive
+# ---------------------------------------------------------------------------
+
+@main.command(name="archive")
+@click.option("--output-dir", "-o", required=True,
+              help="Root output directory to archive (from 'prepare'/'collect').")
+@click.option("--archive", "-a", "archive_path", default=None,
+              help="Destination .tar.gz path.  Defaults to "
+                   "<output-dir>/docktail_archive.tar.gz.")
+@click.option("--keep-reports/--no-keep-reports", default=True,
+              help="Exclude docktail_results.csv and docktail_report.txt from "
+                   "the archive so they remain accessible. (default: on)")
+@click.option("--remove-source", is_flag=True, default=False,
+              help="Delete the archived calculation directories after the "
+                   "archive is successfully created.  Report files are never "
+                   "removed.")
+@click.option("--verbose", "-v", is_flag=True, default=False,
+              help="Print each path as it is added to the archive.")
+def archive_cmd(output_dir, archive_path, keep_reports, remove_source, verbose):
+    """Pack xTB calculation files into a compressed tar.gz archive.
+
+    Archives everything under OUTPUT_DIR except the CSV results and
+    plain-text report files (which remain on disk for easy access).
+    Use --remove-source to free disk space after archiving.
+
+    \b
+    Examples:
+      docktail archive --output-dir output_facts_best
+      docktail archive --output-dir output_facts_best --remove-source
+      docktail archive -o output_facts_best -a /scratch/cxcr4_calcs.tar.gz
+    """
+    try:
+        dest = archive(
+            output_dir,
+            archive_path=archive_path,
+            keep_reports=keep_reports,
+            remove_source=remove_source,
+            verbose=verbose,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    action = "archived and source removed" if remove_source else "archived"
+    click.echo(f"Done — {action}.")
+    click.echo(f"  Archive: {dest}")
+    if keep_reports:
+        click.echo(f"  Kept:    {Path(output_dir) / 'docktail_results.csv'}")
+        click.echo(f"  Kept:    {Path(output_dir) / 'docktail_report.txt'}")
+
+
+# ---------------------------------------------------------------------------
+# recharge
+# ---------------------------------------------------------------------------
+
+@main.command(name="recharge")
+@click.option("--output-dir", "-o", required=True,
+              help="Root output directory (from 'prepare').")
+@click.option("--script-list", default=None,
+              help="Where to write the updated script list of jobs that still "
+                   "need to run.  Defaults to <output-dir>/../script_list.txt.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Report what would change without modifying any files.")
+@click.option("--verbose", "-v", is_flag=True, default=False,
+              help="Print per-ligand status.")
+def recharge_cmd(output_dir, script_list, dry_run, verbose):
+    """Re-infer ligand charges and repair scripts / clear stale results.
+
+    Scans every per-ligand subdirectory, uses RDKit to infer the correct
+    formal charge, and compares it against the charge embedded in the
+    existing SLURM script.  For ligands where the charge is wrong (e.g.
+    all those prepared when RDKit was unavailable):
+
+    \b
+      * The SLURM script is regenerated with the correct charge.
+      * Completed xTB outputs (xtb.out) are removed so the checkpoint
+        logic in the new script will re-run those steps with the
+        correct charge.
+
+    An updated script list is written containing only the ligands that
+    still need work (wrong charge or incomplete calculations).  Resubmit
+    with:
+
+    \b
+      sbatch --array=1-$(wc -l < script_list.txt)%50 run_array.slm
+
+    \b
+    Examples:
+      docktail recharge --output-dir output_facts_best
+      docktail recharge --output-dir output_facts_best --dry-run --verbose
+    """
+    try:
+        changed = recharge(
+            output_dir,
+            script_list_path=script_list,
+            dry_run=dry_run,
+            verbose=verbose,
+        )
+    except (FileNotFoundError, RuntimeError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    if dry_run:
+        click.echo(f"[dry-run] {len(changed)} ligand(s) would have their charge updated.")
+    else:
+        click.echo(f"Updated {len(changed)} ligand script(s) with corrected charges.")
+
+    if changed:
+        click.echo("Changed ligands (old → new charge):")
+        for name, (old, new) in sorted(changed.items()):
+            click.echo(f"  {name:>8s}: {old:+d} → {new:+d}")
+
+    sl = Path(script_list) if script_list else Path(output_dir).resolve().parent / "script_list.txt"
+    if not dry_run and sl.exists():
+        n = sum(1 for line in sl.read_text().splitlines() if line.strip())
+        click.echo(f"\nScript list updated: {sl}  ({n} job(s) need to run)")
+        click.echo("Resubmit with:")
+        click.echo(f"  sbatch --array=1-{n}%50 --export=ALL,SCRIPT_LIST={sl} run_array.slm")

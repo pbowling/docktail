@@ -6,7 +6,7 @@ import dataclasses
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import yaml
 
@@ -80,9 +80,10 @@ class DocktailConfig:
     # The shared protein PDB is still discovered via protein_pattern at the
     # top level of input_dir.
     pose_score_file: str = ""          # relative path within each ligand subdir, e.g. "results/facts_rescore.tsv"
-    pose_score_column: str = ""        # column name to rank by, e.g. "FACTS"
+    pose_score_column: Union[str, int] = ""  # column name (str) or 0-based index (int) to rank by
+    pose_id_column: Union[str, int] = "pose"  # column name or 0-based index holding the pose identifier
     pose_score_ascending: bool = True  # True = lower score is better
-    pose_file_template: str = "results/cluster/top_{pose}.pdb"  # relative to each ligand subdir
+    pose_file_template: str = "results/cluster/top_{pose}.pdb"  # relative to each ligand subdir; supports {pose} and {row}
 
     # Implicit solvation for GFN2-xTB calculations
     solvent: str = "water"        # solvent name passed to --gbsa / --alpb

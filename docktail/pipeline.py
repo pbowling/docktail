@@ -26,9 +26,12 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
+import shutil
+import tarfile
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
@@ -111,44 +114,31 @@ def _discover_pairs_from_scores(
     input_dir: str,
     protein_pattern: str,
     pose_score_file: str,
-    pose_score_column: str,
+    pose_score_column: Union[str, int],
     pose_score_ascending: bool,
     pose_file_template: str,
+    pose_id_column: Union[str, int] = "pose",
 ) -> List[Tuple[str, str, str]]:
     """Discover ligand poses by selecting the best-scored pose from per-ligand score files.
 
     For each immediate subdirectory of *input_dir* that contains *pose_score_file*,
-    the TSV/CSV is read, rows sorted by *pose_score_column*, and the best pose
-    (lowest value when *pose_score_ascending* is True) is selected.  The
-    corresponding PDB path is built from *pose_file_template* (relative to the
-    ligand subdirectory) with ``{pose}`` replaced by the integer pose number.
+    the score file is read, the best pose is selected (lowest value when
+    *pose_score_ascending* is True), and the corresponding PDB path is built from
+    *pose_file_template*.
+
+    *pose_score_column* and *pose_id_column* may be either column name strings
+    (for files with a header row) or 0-based integer column indices (for
+    headerless whitespace-delimited files).  When *pose_score_column* is an
+    integer, the file is read without assuming a header row.
+
+    *pose_file_template* supports two placeholders:
+      ``{pose}`` – the pose identifier string from *pose_id_column*.
+      ``{row}``  – the 1-based row number of the best-scoring row in the file
+                   (useful when subdirectory names correspond to row order).
 
     The shared protein PDB is discovered from the top level of *input_dir* using
     *protein_pattern*.  If multiple files match, the first sorted match is used
     (one protein shared by all ligands).
-
-    Parameters
-    ----------
-    input_dir:
-        Root cdocker directory containing both the shared ``protein.pdb`` and
-        the numbered ligand subdirectories.
-    protein_pattern:
-        Glob pattern for the protein PDB at the top level of *input_dir*.
-    pose_score_file:
-        Path relative to each ligand subdirectory pointing to the score file,
-        e.g. ``"results/facts_rescore.tsv"``.
-    pose_score_column:
-        Column name in the score file used to rank poses, e.g. ``"FACTS"``.
-    pose_score_ascending:
-        When True the pose with the *lowest* value is selected (default for
-        energy/score-like quantities).
-    pose_file_template:
-        Path template relative to each ligand subdirectory with a ``{pose}``
-        placeholder, e.g. ``"results/cluster/top_{pose}.pdb"``.
-
-    Returns
-    -------
-    Sorted list of ``(ligand_name, protein_pdb, ligand_pdb)`` tuples.
     """
     p = Path(input_dir)
 
@@ -169,6 +159,15 @@ def _discover_pairs_from_scores(
             stacklevel=3,
         )
 
+    # Determine reading mode: headerless when score column is specified by index
+    headerless = isinstance(pose_score_column, int)
+    if headerless and isinstance(pose_id_column, str):
+        raise ValueError(
+            "pose_score_column is an integer index but pose_id_column is a string name; "
+            "column specifications must be consistently headerless (int) or "
+            "header-based (str)."
+        )
+
     pairs: List[Tuple[str, str, str]] = []
     missing_score: List[str] = []
     missing_pose: List[str] = []
@@ -182,7 +181,12 @@ def _discover_pairs_from_scores(
             continue
 
         try:
-            df = pd.read_csv(score_path, sep=None, engine="python")
+            df = pd.read_csv(
+                score_path,
+                sep=r"\s+",
+                engine="python",
+                header=None if headerless else "infer",
+            )
         except Exception as exc:
             warnings.warn(
                 f"Could not read score file '{score_path}': {exc}. Skipping.",
@@ -191,31 +195,53 @@ def _discover_pairs_from_scores(
             )
             continue
 
-        if pose_score_column not in df.columns:
-            raise ValueError(
-                f"Column '{pose_score_column}' not found in '{score_path}'. "
-                f"Available columns: {list(df.columns)}"
-            )
-        if "pose" not in df.columns:
-            raise ValueError(
-                f"Column 'pose' not found in '{score_path}'. "
-                f"Available columns: {list(df.columns)}"
-            )
+        ncols = len(df.columns)
 
-        best_row = df.sort_values(pose_score_column, ascending=pose_score_ascending).iloc[0]
-        best_pose = int(best_row["pose"])
-        best_score = best_row[pose_score_column]
+        if headerless:
+            # Validate integer column indices
+            if pose_score_column >= ncols:  # type: ignore[operator]
+                raise ValueError(
+                    f"pose_score_column index {pose_score_column} out of range "
+                    f"for '{score_path}' which has {ncols} columns."
+                )
+            id_col_idx = int(pose_id_column)  # type: ignore[arg-type]
+            if id_col_idx >= ncols:
+                raise ValueError(
+                    f"pose_id_column index {id_col_idx} out of range "
+                    f"for '{score_path}' which has {ncols} columns."
+                )
+            score_series = df.iloc[:, int(pose_score_column)]
+            id_series = df.iloc[:, id_col_idx]
+        else:
+            if pose_score_column not in df.columns:
+                raise ValueError(
+                    f"Column '{pose_score_column}' not found in '{score_path}'. "
+                    f"Available columns: {list(df.columns)}"
+                )
+            id_col_name = pose_id_column if isinstance(pose_id_column, str) else "pose"
+            if id_col_name not in df.columns:
+                raise ValueError(
+                    f"Column '{id_col_name}' not found in '{score_path}'. "
+                    f"Available columns: {list(df.columns)}"
+                )
+            score_series = df[pose_score_column]
+            id_series = df[id_col_name]
 
-        pose_rel = pose_file_template.format(pose=best_pose)
+        best_idx = int(score_series.idxmin() if pose_score_ascending else score_series.idxmax())
+        best_pose = str(id_series.iloc[best_idx])
+        best_row_number = best_idx + 1  # 1-based row number in the original file
+        best_score = score_series.iloc[best_idx]
+
+        pose_rel = pose_file_template.format(pose=best_pose, row=best_row_number)
         pose_pdb = str(subdir / pose_rel)
         if not Path(pose_pdb).exists():
-            missing_pose.append(f"{subdir.name} (pose {best_pose}: {pose_pdb})")
+            missing_pose.append(
+                f"{subdir.name} (row {best_row_number}, pose {best_pose}: {pose_pdb})"
+            )
             continue
 
         name = subdir.name
         pairs.append((name, protein_pdb, pose_pdb))
-        # Attach score metadata as an attribute so prepare() can log it
-        pairs[-1] = (name, protein_pdb, pose_pdb)
 
     if missing_score:
         warnings.warn(
@@ -243,6 +269,7 @@ def _discover_pairs_from_scores(
         )
 
     return pairs
+
 
 
 def _infer_ligand_resname(ligand_pdb: str) -> str:
@@ -277,7 +304,7 @@ def prepare(cfg: DocktailConfig) -> List[str]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if cfg.pose_score_file:
-        if not cfg.pose_score_column:
+        if cfg.pose_score_column == "":
             raise ValueError(
                 "'pose_score_column' must be set when 'pose_score_file' is provided."
             )
@@ -288,6 +315,7 @@ def prepare(cfg: DocktailConfig) -> List[str]:
             cfg.pose_score_column,
             cfg.pose_score_ascending,
             cfg.pose_file_template,
+            cfg.pose_id_column,
         )
     else:
         pairs = _discover_pairs(cfg.input_dir, cfg.protein_pattern, cfg.ligand_pattern)
@@ -825,6 +853,280 @@ def run_full_pipeline(
     # No SLURM: run xTB calculations directly (for testing / small jobs)
     _run_xtb_calculations_directly(cfg)
     return collect(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Archive
+# ---------------------------------------------------------------------------
+
+# Files at the root of output_dir that hold the summary results and should
+# remain on disk and be excluded from the tar archive by default.
+_REPORT_FILENAMES: tuple[str, ...] = (
+    "docktail_results.csv",
+    "docktail_report.txt",
+)
+
+
+def archive(
+    output_dir: str | Path,
+    archive_path: str | Path | None = None,
+    keep_reports: bool = True,
+    remove_source: bool = False,
+    verbose: bool = False,
+) -> Path:
+    """Create a compressed tar archive of xTB calculation files.
+
+    Archives every file and subdirectory under *output_dir* except the CSV
+    results and plain-text report (``docktail_results.csv`` and
+    ``docktail_report.txt``), which are kept in place so the summary data
+    remains immediately accessible.
+
+    Parameters
+    ----------
+    output_dir:
+        Root output directory produced by ``docktail prepare`` / ``collect``.
+    archive_path:
+        Destination ``.tar.gz`` path.  Defaults to
+        ``<output_dir>/docktail_archive.tar.gz``.
+    keep_reports:
+        If ``True`` (default), ``docktail_results.csv`` and
+        ``docktail_report.txt`` at the root of *output_dir* are excluded from
+        the archive and left on disk.
+    remove_source:
+        If ``True``, delete the archived per-ligand subdirectories (and
+        ``_docktail_cfg.yaml`` if present) after the archive is successfully
+        created.  Report files are never removed regardless of this flag.
+    verbose:
+        If ``True``, print each path added to the archive.
+
+    Returns
+    -------
+    Path to the created archive file.
+    """
+    out_dir = Path(output_dir).resolve()
+    if not out_dir.is_dir():
+        raise FileNotFoundError(f"output_dir does not exist: {out_dir}")
+
+    if archive_path is None:
+        dest = out_dir / "docktail_archive.tar.gz"
+    else:
+        dest = Path(archive_path).resolve()
+
+    # Paths to exclude from the archive (report files at the root).
+    excluded: set[Path] = set()
+    if keep_reports:
+        for name in _REPORT_FILENAMES:
+            candidate = out_dir / name
+            if candidate.exists():
+                excluded.add(candidate)
+    # Always exclude the archive file itself to prevent recursion.
+    excluded.add(dest)
+
+    archived_items: list[Path] = []
+
+    with tarfile.open(dest, "w:gz") as tf:
+        for item in sorted(out_dir.iterdir()):
+            if item.resolve() in excluded:
+                continue
+            arcname = item.name  # store relative to output_dir root
+            if verbose:
+                print(f"  adding {arcname}")
+            tf.add(str(item), arcname=arcname, recursive=True)
+            archived_items.append(item)
+
+    if remove_source:
+        for item in archived_items:
+            if item.is_dir():
+                shutil.rmtree(item)
+            elif item.is_file():
+                item.unlink()
+
+    return dest
+
+
+# ---------------------------------------------------------------------------
+# Recharge
+# ---------------------------------------------------------------------------
+
+# Regex to extract the ligand charge embedded in a generated SLURM script.
+# Matches specifically the sp_ligand xTB command line (single-line, no DOTALL) so
+# it cannot accidentally pick up the --chrg from the sp_complex command.
+# The "sp_ligand" token first appears in the "mkdir -p ... sp_ligand" line, which
+# has no "--chrg", so the old DOTALL pattern would skip past it and grab the first
+# "--chrg" it found — which belonged to sp_complex.  The line-bounded pattern
+# below anchors on the "cd .../sp_ligand" portion of the xTB invocation line.
+_SP_LIGAND_CHRG_RE = re.compile(
+    r"cd\s+\S+/sp_ligand\b[^\n]*--chrg\s+(-?\d+)"
+)
+
+# xTB output subdirectories to clear when the ligand charge changes.
+# sp_protein is intentionally excluded: its charge depends only on the
+# trimmed protein shell, which is independent of the ligand formal charge.
+_XTB_RESULT_SUBDIRS = ("relax_complex", "sp_complex", "sp_ligand")
+
+
+def _parse_embedded_ligand_charge(script_text: str) -> Optional[int]:
+    """Return the ligand charge currently embedded in a SLURM script, or None."""
+    m = _SP_LIGAND_CHRG_RE.search(script_text)
+    return int(m.group(1)) if m else None
+
+
+def _step_is_complete(step_dir: Path) -> bool:
+    """Return True when *step_dir/xtb.out* contains a successful TOTAL ENERGY line."""
+    out = step_dir / "xtb.out"
+    if not out.exists() or out.stat().st_size == 0:
+        return False
+    try:
+        return "TOTAL ENERGY" in out.read_text(errors="replace")
+    except OSError:
+        return False
+
+
+def recharge(
+    output_dir: str | Path,
+    *,
+    script_list_path: str | Path | None = None,
+    dry_run: bool = False,
+    verbose: bool = False,
+) -> dict[str, tuple[int, int]]:
+    """Re-infer ligand formal charges and repair scripts / clear stale results.
+
+    For each per-ligand subdirectory under *output_dir*:
+
+    1. Read ``ligand.pdb`` and infer the formal charge with RDKit.
+    2. Compare against the charge embedded in the existing ``*_docktail.sh``
+       script (the ``--chrg`` value on the ``sp_ligand`` xtb command).
+    3. If the charge differs (e.g. was set to 0 as a fallback because RDKit
+       was unavailable during ``prepare``):
+
+       * Regenerate the SLURM script with the correct charge, using the saved
+         ``_docktail_cfg.yaml`` from *output_dir*.
+       * Clear ``xtb.out`` from every completed xTB subdirectory so the
+         checkpoint logic in the script will re-run those steps.
+
+    4. Optionally write a new ``script_list.txt`` containing only the ligand
+       scripts that still need work (charge was wrong *or* calculations are
+       not yet complete).
+
+    Parameters
+    ----------
+    output_dir:
+        Root output directory produced by ``docktail prepare``.
+    script_list_path:
+        Where to write the updated script list.  Defaults to
+        ``<output_dir>/../script_list.txt`` (the location used by
+        ``submit_all.slm``).
+    dry_run:
+        If ``True``, report what would change without modifying any files.
+    verbose:
+        If ``True``, print per-ligand status.
+
+    Returns
+    -------
+    Dict mapping ligand name → ``(old_charge, new_charge)`` for every ligand
+    whose charge was updated.
+    """
+    from .config import load_config as _load_config
+    from .slurm import generate_ligand_jobs as _gen_jobs
+
+    out_dir = Path(output_dir).resolve()
+    if not out_dir.is_dir():
+        raise FileNotFoundError(f"output_dir does not exist: {out_dir}")
+
+    cfg_path = out_dir / "_docktail_cfg.yaml"
+    if not cfg_path.exists():
+        raise FileNotFoundError(
+            f"Saved config not found at {cfg_path}. "
+            "Run 'docktail prepare' first."
+        )
+    cfg = _load_config(str(cfg_path))
+
+    lig_dirs = sorted(
+        d for d in out_dir.iterdir()
+        if d.is_dir() and not d.name.startswith("_") and not d.name.startswith(".")
+    )
+
+    changed: dict[str, tuple[int, int]] = {}
+    scripts_needing_run: list[Path] = []
+
+    for lig_dir in lig_dirs:
+        name = lig_dir.name
+        script = lig_dir / f"{name}_docktail.sh"
+        ligand_pdb = lig_dir / "ligand.pdb"
+
+        if not script.exists() or not ligand_pdb.exists():
+            if verbose:
+                print(f"  {name}: skipping (missing script or ligand.pdb)")
+            continue
+
+        # Infer correct charge
+        new_charge = infer_ligand_charge(str(ligand_pdb))
+        if new_charge is None:
+            if verbose:
+                print(f"  {name}: RDKit could not infer charge — keeping existing")
+            # Still check if calculations are incomplete
+            sp_done = all(
+                _step_is_complete(lig_dir / sd)
+                for sd in ("sp_complex", "sp_protein", "sp_ligand")
+            )
+            if not sp_done:
+                scripts_needing_run.append(script)
+            continue
+
+        script_text = script.read_text()
+        old_charge = _parse_embedded_ligand_charge(script_text)
+
+        charge_wrong = (old_charge is not None) and (old_charge != new_charge)
+        sp_done = all(
+            _step_is_complete(lig_dir / sd)
+            for sd in ("sp_complex", "sp_protein", "sp_ligand")
+        )
+
+        if verbose:
+            status = (
+                f"charge {old_charge}→{new_charge} (WRONG)" if charge_wrong
+                else f"charge {old_charge} (ok)"
+            )
+            done_str = "complete" if sp_done else "incomplete"
+            print(f"  {name}: {status}, calc {done_str}")
+
+        if charge_wrong:
+            changed[name] = (old_charge, new_charge)  # type: ignore[assignment]
+            if not dry_run:
+                # Regenerate script with correct charge
+                _gen_jobs(
+                    [name],
+                    str(out_dir),
+                    cfg,
+                    ligand_charges={name: new_charge},
+                    config_path=str(cfg_path),
+                )
+                # Clear stale xTB outputs so checkpoint logic re-runs them
+                for subdir in _XTB_RESULT_SUBDIRS:
+                    stale_out = lig_dir / subdir / "xtb.out"
+                    if stale_out.exists():
+                        stale_out.unlink()
+                # Also remove sp_complex.pdb so trim-relaxed reruns
+                sp_cplx_pdb = lig_dir / "sp_complex.pdb"
+                if sp_cplx_pdb.exists():
+                    sp_cplx_pdb.unlink()
+            scripts_needing_run.append(script)
+        elif not sp_done:
+            scripts_needing_run.append(script)
+
+    # Write updated script list
+    if script_list_path is None:
+        script_list_path = out_dir.parent / "script_list.txt"
+    script_list_path = Path(script_list_path)
+
+    if not dry_run:
+        script_list_path.write_text(
+            "\n".join(str(s) for s in scripts_needing_run) + (
+                "\n" if scripts_needing_run else ""
+            )
+        )
+
+    return changed
 
 
 def _run_xtb_calculations_directly(cfg: DocktailConfig) -> None:

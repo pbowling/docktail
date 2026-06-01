@@ -40,6 +40,34 @@ ulimit -s unlimited
 
 set -euo pipefail
 
+# Checkpoint helper: returns true when a step already has a successful xtb.out.
+# This makes jobs restartable -- re-submitting will skip completed steps.
+xtb_done() { [[ -f "$$1/xtb.out" ]] && grep -q "TOTAL ENERGY" "$$1/xtb.out" 2>/dev/null; }
+
+# xTB runner with OOM and error detection.
+# Usage: run_xtb <step_dir> <parent_dir> <xtb_exe> [xtb_args...]
+# Redirects stdout/stderr to xtb.out/xtb.err inside step_dir.
+# Exit 137 (SIGKILL / OOM) is caught and reported clearly before exiting.
+run_xtb() {
+  local step_dir="$$1" parent_dir="$$2"; shift 2
+  cd "$$step_dir"
+  set +e
+  "$$@" > xtb.out 2> xtb.err
+  local ec=$$?
+  set -e
+  cd "$$parent_dir"
+  if [[ $$ec -eq 137 ]]; then
+    echo "ERROR: xTB was OOM-killed (exit 137) in $$(basename $$step_dir)" >&2
+    echo "  Increase memory: change #SBATCH --mem in the array script and resubmit." >&2
+    echo "  Step dir: $$step_dir" >&2
+    exit 137
+  elif [[ $$ec -ne 0 ]]; then
+    echo "ERROR: xTB exited with code $$ec in $$(basename $$step_dir)" >&2
+    echo "  See: $$step_dir/xtb.err" >&2
+    exit $$ec
+  fi
+}
+
 cd "${work_dir}"
 
 ${commands}
@@ -257,8 +285,6 @@ def generate_ligand_jobs(
             relax_pl = str(Path(lig_dir) / "relax_complex")
 
             if cfg.relax_trimmed:
-                # Relax only the trimmed region; apply harmonic constraints
-                # to boundary C atoms and H caps to prevent unphysical drift.
                 relax_input = str(Path(lig_dir) / "complex.pdb")
                 constraints_file = str(Path(lig_dir) / "relax_constraints.inp")
                 constrain_flag = f" --input {constraints_file}"
@@ -268,21 +294,29 @@ def generate_ligand_jobs(
                 constrain_flag = ""
                 relax_label = "# Relax complex (full, no trim)"
 
-            commands += [
-                f"mkdir -p {relax_pl}",
-                relax_label,
-                f"cd {relax_pl} && {cfg.xtb_exe} {relax_input} "
+            relax_args = (
+                f"{cfg.xtb_exe} {relax_input} "
                 + " ".join(_xtb_method_flag_str(cfg.relax_method))
                 + f" --opt --chrg {relax_cplx_charge} --uhf {cplx_uhf}"
                 + constrain_flag
-                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
-                f'if grep -q "ABNORMAL TERMINATION" {relax_pl}/xtb.out; then echo "ERROR: xTB relax (complex) terminated abnormally \u2013 skipping scoring" >&2; exit 1; fi',
+            )
+            relax_cmd = f"run_xtb {relax_pl} {lig_dir} {relax_args}"
+            commands += [
+                f"mkdir -p {relax_pl}",
+                f"if ! xtb_done {relax_pl}; then",
+                f"  {relax_label}",
+                f"  {relax_cmd}",
+                f'  if grep -q "ABNORMAL TERMINATION" {relax_pl}/xtb.out; then echo "ERROR: xTB relax (complex) terminated abnormally -- skipping scoring" >&2; exit 1; fi',
+                f"fi",
             ]
 
             if config_path:
+                # Only re-trim if the SP input files are missing (i.e. relax just ran or was cleared).
                 commands += [
-                    f"# Separate protein/ligand from relaxed complex; trim for SP scoring",
-                    f"docktail trim-relaxed --lig-dir {lig_dir} --config {config_path}",
+                    f"if [[ ! -f {lig_dir}/sp_complex.pdb ]]; then",
+                    f"  # Separate protein/ligand from relaxed complex; trim for SP scoring",
+                    f"  docktail trim-relaxed --lig-dir {lig_dir} --config {config_path}",
+                    f"fi",
                 ]
 
             # SP inputs: separated from relaxed complex by trim-relaxed
@@ -300,29 +334,48 @@ def generate_ligand_jobs(
         sp_p  = str(Path(lig_dir) / "sp_protein")
         sp_l  = str(Path(lig_dir) / "sp_ligand")
 
-        commands += [
-            f"mkdir -p {sp_pl} {sp_p} {sp_l}",
-            f"# Single-point complex",
-            f"cd {sp_pl} && {cfg.xtb_exe} {complex_pdb_sp} "
+        sp_cplx_cmd = (
+            f"run_xtb {sp_pl} {lig_dir} "
+            + f"{cfg.xtb_exe} {complex_pdb_sp} "
             + " ".join(_xtb_method_flag_str(cfg.method))
             + f" --chrg {sp_cplx_charge} --uhf {cplx_uhf}"
             + solvent_str + iter_flag
-            + f" > xtb.out 2> xtb.err && cd {lig_dir}",
-            f'if grep -qi "convergence criteria cannot be satisfied\\|SCF not converged\\|did not converge" {sp_pl}/xtb.out; then echo "WARNING: SCF did not converge for sp_complex (charge={sp_cplx_charge}) -- energy unreliable; consider increasing xtb_scf_iterations" >&2; fi',
-            f"# Single-point protein",
-            f"cd {sp_p} && {cfg.xtb_exe} {protein_pdb_sp} "
+        )
+        sp_prot_cmd = (
+            f"run_xtb {sp_p} {lig_dir} "
+            + f"{cfg.xtb_exe} {protein_pdb_sp} "
             + " ".join(_xtb_method_flag_str(cfg.method))
             + f" --chrg {sp_prot_charge} --uhf {cfg.protein_uhf}"
             + solvent_str + iter_flag
-            + f" > xtb.out 2> xtb.err && cd {lig_dir}",
-            f'if grep -qi "convergence criteria cannot be satisfied\\|SCF not converged\\|did not converge" {sp_p}/xtb.out; then echo "WARNING: SCF did not converge for sp_protein (charge={sp_prot_charge}) -- energy unreliable" >&2; fi',
-            f"# Single-point ligand",
-            f"cd {sp_l} && {cfg.xtb_exe} {ligand_pdb_sp} "
+        )
+        sp_lig_cmd = (
+            f"run_xtb {sp_l} {lig_dir} "
+            + f"{cfg.xtb_exe} {ligand_pdb_sp} "
             + " ".join(_xtb_method_flag_str(cfg.method))
             + f" --chrg {lig_charge} --uhf {cfg.ligand_uhf}"
             + solvent_str + iter_flag
-            + f" > xtb.out 2> xtb.err && cd {lig_dir}",
-            f'if grep -qi "convergence criteria cannot be satisfied\\|SCF not converged\\|did not converge" {sp_l}/xtb.out; then echo "WARNING: SCF did not converge for sp_ligand -- energy unreliable" >&2; fi',
+        )
+
+        commands += [
+            f"mkdir -p {sp_pl} {sp_p} {sp_l}",
+            # --- sp_complex ---
+            f"if ! xtb_done {sp_pl}; then",
+            f"  # Single-point complex",
+            f"  {sp_cplx_cmd}",
+            f'  if grep -qi "convergence criteria cannot be satisfied\\|SCF not converged\\|did not converge" {sp_pl}/xtb.out; then echo "WARNING: SCF did not converge for sp_complex (charge={sp_cplx_charge}) -- energy unreliable; consider increasing xtb_scf_iterations" >&2; fi',
+            f"fi",
+            # --- sp_protein ---
+            f"if ! xtb_done {sp_p}; then",
+            f"  # Single-point protein",
+            f"  {sp_prot_cmd}",
+            f'  if grep -qi "convergence criteria cannot be satisfied\\|SCF not converged\\|did not converge" {sp_p}/xtb.out; then echo "WARNING: SCF did not converge for sp_protein (charge={sp_prot_charge}) -- energy unreliable" >&2; fi',
+            f"fi",
+            # --- sp_ligand ---
+            f"if ! xtb_done {sp_l}; then",
+            f"  # Single-point ligand",
+            f"  {sp_lig_cmd}",
+            f'  if grep -qi "convergence criteria cannot be satisfied\\|SCF not converged\\|did not converge" {sp_l}/xtb.out; then echo "WARNING: SCF did not converge for sp_ligand -- energy unreliable" >&2; fi',
+            f"fi",
         ]
 
         if cfg.oniom:
@@ -358,30 +411,25 @@ def generate_ligand_jobs(
             commands += [
                 f"mkdir -p {ff_full_cplx_dir} {ff_full_prot_dir} {ff_trim_cplx_dir} {ff_trim_prot_dir} {ff_lig_dir}",
                 f"# ONIOM GFN-FF SP: full complex",
-                f"cd {ff_full_cplx_dir} && {cfg.xtb_exe} {full_cplx_oniom} "
-                + mm_flags
-                + f" --chrg {cplx_charge} --uhf {cplx_uhf}"
-                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+                f"run_xtb {ff_full_cplx_dir} {lig_dir} "
+                + f"{cfg.xtb_exe} {full_cplx_oniom} " + mm_flags
+                + f" --chrg {cplx_charge} --uhf {cplx_uhf}",
                 f"# ONIOM GFN-FF SP: full protein",
-                f"cd {ff_full_prot_dir} && {cfg.xtb_exe} {full_prot_oniom} "
-                + mm_flags
-                + f" --chrg {cfg.protein_charge} --uhf {cfg.protein_uhf}"
-                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+                f"run_xtb {ff_full_prot_dir} {lig_dir} "
+                + f"{cfg.xtb_exe} {full_prot_oniom} " + mm_flags
+                + f" --chrg {cfg.protein_charge} --uhf {cfg.protein_uhf}",
                 f"# ONIOM GFN-FF SP: ligand",
-                f"cd {ff_lig_dir} && {cfg.xtb_exe} {lig_oniom} "
-                + mm_flags
-                + f" --chrg {lig_charge} --uhf {cfg.ligand_uhf}"
-                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+                f"run_xtb {ff_lig_dir} {lig_dir} "
+                + f"{cfg.xtb_exe} {lig_oniom} " + mm_flags
+                + f" --chrg {lig_charge} --uhf {cfg.ligand_uhf}",
                 f"# ONIOM GFN-FF SP: trimmed complex",
-                f"cd {ff_trim_cplx_dir} && {cfg.xtb_exe} {trim_cplx_oniom} "
-                + mm_flags
-                + f" --chrg {sp_cplx_charge} --uhf {cplx_uhf}"
-                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+                f"run_xtb {ff_trim_cplx_dir} {lig_dir} "
+                + f"{cfg.xtb_exe} {trim_cplx_oniom} " + mm_flags
+                + f" --chrg {sp_cplx_charge} --uhf {cplx_uhf}",
                 f"# ONIOM GFN-FF SP: trimmed protein",
-                f"cd {ff_trim_prot_dir} && {cfg.xtb_exe} {trim_prot_oniom} "
-                + mm_flags
-                + f" --chrg {sp_prot_charge} --uhf {cfg.protein_uhf}"
-                + f" > xtb.out 2> xtb.err && cd {lig_dir}",
+                f"run_xtb {ff_trim_prot_dir} {lig_dir} "
+                + f"{cfg.xtb_exe} {trim_prot_oniom} " + mm_flags
+                + f" --chrg {sp_prot_charge} --uhf {cfg.protein_uhf}",
             ]
 
         script_path = str(Path(lig_dir) / f"{name}_docktail.sh")
