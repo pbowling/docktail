@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import resource
 import shutil
 import subprocess
 import warnings
@@ -155,6 +156,34 @@ def _run_xtb(
     in the xTB output regardless of the process exit code.
     """
     os.makedirs(work_dir, exist_ok=True)
+
+    # Remove stale xtb topology/charge files that would be silently re-read
+    # by a new run and cause charge-consistency errors (e.g. gfnff_charges).
+    _STALE_XTB_FILES = (
+        "gfnff_charges", "gfnff_topo", "xtbrestart", "charges",
+        ".xtboptok", "wbo",
+    )
+    for _fname in _STALE_XTB_FILES:
+        _fpath = Path(work_dir) / _fname
+        if _fpath.exists():
+            _fpath.unlink()
+
+    def _unlimit_stack() -> None:
+        """Raise the stack size limit to unlimited in the child process."""
+        try:
+            resource.setrlimit(
+                resource.RLIMIT_STACK,
+                (resource.RLIM_INFINITY, resource.RLIM_INFINITY),
+            )
+        except (ValueError, OSError):
+            pass
+
+    # Propagate the current environment and ensure OMP_STACKSIZE is set so
+    # that OpenMP threads also get a large stack (avoids SIGSEGV in GFN-FF
+    # neighbour-list building for large systems).
+    env = os.environ.copy()
+    env.setdefault("OMP_STACKSIZE", "16G")
+
     out_path = Path(work_dir) / stdout_file
     err_path = Path(work_dir) / stderr_file
     with open(out_path, "w") as out_fh, open(err_path, "w") as err_fh:
@@ -163,6 +192,8 @@ def _run_xtb(
             cwd=work_dir,
             stdout=out_fh,
             stderr=err_fh,
+            env=env,
+            preexec_fn=_unlimit_stack,
         )
     # Detect abnormal termination even when the exit code is 0
     if check_xtb_termination(str(out_path)) == "abnormal":
